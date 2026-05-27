@@ -1,0 +1,143 @@
+// firestore.rules
+// Production security rules for DashWise.
+// Each rule enforces that users can only access their own data.
+// Team members can access shared team data.
+// Admins can access org-wide data.
+
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ── Helper functions ───────────────────────────────────
+    
+    // Is the request from a logged-in user?
+    function isAuth() {
+      return request.auth != null;
+    }
+
+    // Is the logged-in user the owner of this document?
+    function isOwner(uid) {
+      return isAuth() && request.auth.uid == uid;
+    }
+
+    // Is the user a member of a specific team?
+    function isTeamMember(teamId) {
+      return isAuth() &&
+        exists(/databases/$(database)/documents/teams/$(teamId)/members/$(request.auth.uid));
+    }
+
+    // Is the user an admin of a specific team?
+    function isTeamAdmin(teamId) {
+      return isAuth() &&
+        get(/databases/$(database)/documents/teams/$(teamId)/members/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // Is the user part of a specific organisation?
+    function isOrgMember(orgId) {
+      return isAuth() &&
+        exists(/databases/$(database)/documents/organisations/$(orgId)/members/$(request.auth.uid));
+    }
+
+    // Is the user an org admin?
+    function isOrgAdmin(orgId) {
+      return isAuth() &&
+        get(/databases/$(database)/documents/organisations/$(orgId)/members/$(request.auth.uid)).data.role == "admin";
+    }
+
+    // ── User profiles ──────────────────────────────────────
+    // Users can only read and write their own profile.
+    match /users/{uid} {
+      allow read, write: if isOwner(uid);
+
+      // Folders — only the owner
+      match /folders/{folderId} {
+        allow read, write: if isOwner(uid);
+
+        // Files inside folders — only the owner
+        match /files/{fileId} {
+          allow read, write: if isOwner(uid);
+        }
+      }
+
+      // Chat history — only the owner
+      match /chats/{chatId} {
+        allow read, write: if isOwner(uid);
+      }
+
+      // Upload history — only the owner
+      match /uploads/{uploadId} {
+        allow read, write: if isOwner(uid);
+      }
+    }
+
+    // ── Teams (Team tier) ──────────────────────────────────
+    // Team members can read shared data.
+    // Only team admins can write team config.
+    match /teams/{teamId} {
+      allow read:  if isTeamMember(teamId);
+      allow write: if isTeamAdmin(teamId);
+
+      // Member list — only admins can add/remove
+      match /members/{memberId} {
+        allow read:  if isTeamMember(teamId);
+        allow write: if isTeamAdmin(teamId);
+      }
+
+      // Shared folders — all members can read, admins can write
+      match /folders/{folderId} {
+        allow read:  if isTeamMember(teamId);
+        allow write: if isTeamAdmin(teamId);
+
+        match /files/{fileId} {
+          allow read:  if isTeamMember(teamId);
+          allow write: if isTeamAdmin(teamId);
+        }
+      }
+
+      // Shared analyses — members read, admins write
+      match /analyses/{analysisId} {
+        allow read:  if isTeamMember(teamId);
+        allow write: if isTeamAdmin(teamId);
+      }
+    }
+
+    // ── Organisations (Business / Enterprise tier) ─────────
+    // Company-wide data isolated per org.
+    // Only org members can access their org data.
+    match /organisations/{orgId} {
+      allow read:  if isOrgMember(orgId);
+      allow write: if isOrgAdmin(orgId);
+
+      match /members/{memberId} {
+        allow read:  if isOrgMember(orgId);
+        allow write: if isOrgAdmin(orgId);
+      }
+
+      match /folders/{folderId} {
+        allow read:  if isOrgMember(orgId);
+        allow write: if isOrgAdmin(orgId);
+
+        match /files/{fileId} {
+          allow read:  if isOrgMember(orgId);
+          allow write: if isOrgAdmin(orgId);
+        }
+      }
+
+      match /settings/{doc} {
+        allow read:  if isOrgMember(orgId);
+        allow write: if isOrgAdmin(orgId);
+      }
+
+      match /kpiGlossary/{doc} {
+        allow read:  if isOrgMember(orgId);
+        allow write: if isOrgAdmin(orgId);
+      }
+    }
+
+    // ── Deny everything else ───────────────────────────────
+    // Any path not explicitly matched above is denied.
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
