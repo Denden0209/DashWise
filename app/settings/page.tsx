@@ -1,109 +1,91 @@
 "use client";
-// app/settings/page.tsx — ACCOUNT SETTINGS
-// Edit profile, view subscription, sign out.
-
 import { useState } from "react";
 import Link from "next/link";
-import Nav from "@/components/Nav";
-
 import { signOut } from "firebase/auth";
 import { useRouter } from "next/navigation";
 import { auth } from "@/lib/firebase";
 import { useAuth } from "@/lib/AuthContext";
 import { updateUserProfile } from "@/lib/db";
+import Nav from "@/components/Nav";
 
 export default function SettingsPage() {
   const router = useRouter();
   const { user, profile, refreshProfile } = useAuth();
-  const [saving,  setSaving]  = useState(false);
-  const [saved,   setSaved]   = useState(false);
   const [bizName, setBizName] = useState(profile?.bizName || "");
   const [tone,    setTone]    = useState(profile?.advisorTone || "balanced");
+  const [saving,  setSaving]  = useState(false);
+  const [saved,   setSaved]   = useState(false);
 
   async function handleSave() {
     if (!user) return;
     setSaving(true);
     await updateUserProfile(user.uid, { bizName, advisorTone: tone });
     await refreshProfile();
-    setSaved(true);
-    setSaving(false);
+    setSaved(true); setSaving(false);
     setTimeout(() => setSaved(false), 2000);
   }
 
-  async function handleLogout() {
-    await signOut(auth);
-    router.push("/");
-  }
-
-  const planColors: Record<string, string> = {
-    free: "bg-gray-100 text-gray-700",
-    pro:  "bg-blue-100 text-blue-700",
-    team: "bg-purple-100 text-purple-700",
-    business: "bg-orange-100 text-orange-700",
-  };
+  const planColors: Record<string,string> = { free:"#9e9e9e", pro:"#2997ff", team:"#bf5af2", business:"#ffd60a" };
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div style={{ minHeight: "100vh", background: "#000" }}>
       <Nav />
-
-      <main className="max-w-2xl mx-auto px-6 py-8 space-y-6">
-        <h1 className="text-2xl font-bold text-gray-900">Settings</h1>
+      <main style={{ maxWidth: 680, margin: "0 auto", padding: "40px 24px" }}>
+        <h1 style={{ fontSize: 28, fontWeight: 700, letterSpacing: "-0.5px", color: "#f5f5f7", marginBottom: 32 }}>Settings</h1>
 
         {/* Profile */}
-        <div className="bg-white rounded-xl border border-gray-100 p-6">
-          <h2 className="font-semibold text-gray-900 mb-4">Business Profile</h2>
-          <div className="space-y-4">
+        <div style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 18, padding: 24, marginBottom: 16 }}>
+          <h2 style={{ fontSize: 15, fontWeight: 600, color: "#f5f5f7", marginBottom: 20 }}>Business Profile</h2>
+          <div style={{ display: "flex", flexDirection: "column", gap: 16 }}>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-1">Business name</label>
-              <input value={bizName} onChange={e => setBizName(e.target.value)}
-                className="w-full border border-gray-300 rounded-lg px-3 py-2.5 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500"/>
+              <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "rgba(245,245,247,0.5)", marginBottom: 6 }}>Business name</label>
+              <input value={bizName} onChange={e => setBizName(e.target.value)} style={{ width: "100%", background: "rgba(255,255,255,0.06)", border: "1px solid rgba(255,255,255,0.1)", borderRadius: 10, padding: "11px 14px", fontSize: 14, color: "#f5f5f7" }}/>
             </div>
             <div>
-              <label className="block text-sm font-medium text-gray-700 mb-2">Advisor tone</label>
-              <div className="flex gap-2">
+              <label style={{ display: "block", fontSize: 12, fontWeight: 500, color: "rgba(245,245,247,0.5)", marginBottom: 8 }}>Advisor tone</label>
+              <div style={{ display: "flex", gap: 8 }}>
                 {["direct","balanced","coaching"].map(t => (
-                  <button key={t} onClick={() => setTone(t)}
-                    className={`flex-1 py-2 rounded-lg border text-sm font-medium capitalize transition-all ${tone===t?"border-blue-600 bg-blue-50 text-blue-700":"border-gray-200 hover:border-gray-300"}`}>
-                    {t}
-                  </button>
+                  <button key={t} onClick={() => setTone(t)} style={{
+                    flex: 1, padding: "10px 8px", borderRadius: 10, fontSize: 13, fontWeight: 500,
+                    background: tone === t ? "#2997ff" : "rgba(255,255,255,0.06)",
+                    border: tone === t ? "1px solid #2997ff" : "1px solid rgba(255,255,255,0.1)",
+                    color: tone === t ? "#fff" : "rgba(245,245,247,0.6)",
+                    cursor: "pointer", fontFamily: "inherit", textTransform: "capitalize",
+                  }}>{t}</button>
                 ))}
               </div>
             </div>
-            <button onClick={handleSave} disabled={saving}
-              className="w-full bg-blue-600 text-white font-bold py-2.5 rounded-lg hover:bg-blue-700 disabled:opacity-40 text-sm">
+            <button onClick={handleSave} disabled={saving} style={{ background: "#2997ff", color: "#fff", fontWeight: 600, fontSize: 14, padding: "12px", borderRadius: 10, border: "none", cursor: "pointer", fontFamily: "inherit" }}>
               {saved ? "✓ Saved!" : saving ? "Saving..." : "Save changes"}
             </button>
           </div>
         </div>
 
         {/* Subscription */}
-        <div className="bg-white rounded-xl border border-gray-100 p-6">
-          <h2 className="font-semibold text-gray-900 mb-4">Subscription</h2>
-          <div className="flex items-center gap-3 mb-4">
-            <span className={`text-sm font-bold px-3 py-1 rounded-full capitalize ${planColors[profile?.subscription || "free"]}`}>
+        <div style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 18, padding: 24, marginBottom: 16 }}>
+          <h2 style={{ fontSize: 15, fontWeight: 600, color: "#f5f5f7", marginBottom: 16 }}>Subscription</h2>
+          <div style={{ display: "flex", alignItems: "center", gap: 12, marginBottom: 16 }}>
+            <span style={{ fontSize: 13, fontWeight: 600, padding: "4px 12px", borderRadius: 20, background: `${planColors[profile?.subscription || "free"]}20`, color: planColors[profile?.subscription || "free"] }}>
               {profile?.subscription || "free"} plan
             </span>
-            <span className="text-sm text-gray-500">{profile?.uploadsCount || 0} total analyses</span>
+            <span style={{ fontSize: 13, color: "rgba(245,245,247,0.4)" }}>{profile?.uploadsCount || 0} total analyses</span>
           </div>
           {profile?.subscription === "free" && (
-            <div className="bg-blue-50 border border-blue-100 rounded-lg p-4">
-              <div className="font-medium text-blue-900 text-sm mb-1">Upgrade to Pro — $29/month</div>
-              <div className="text-blue-700 text-xs mb-3">Unlimited analyses, business memory, advisor chat, and full upload history.</div>
-              <button className="bg-blue-600 text-white text-xs font-bold px-4 py-2 rounded-lg hover:bg-blue-700">
-                Upgrade (coming soon)
-              </button>
+            <div style={{ background: "rgba(41,151,255,0.08)", border: "1px solid rgba(41,151,255,0.2)", borderRadius: 12, padding: 16 }}>
+              <div style={{ fontWeight: 600, fontSize: 14, color: "#2997ff", marginBottom: 4 }}>Upgrade to Pro — $29/month</div>
+              <div style={{ fontSize: 13, color: "rgba(245,245,247,0.45)", marginBottom: 12 }}>Unlimited analyses, business memory, advisor chat, and full upload history.</div>
+              <button style={{ background: "#2997ff", color: "#fff", fontSize: 13, fontWeight: 600, padding: "8px 18px", borderRadius: 8, border: "none", cursor: "pointer", fontFamily: "inherit" }}>Upgrade (coming soon)</button>
             </div>
           )}
         </div>
 
-        {/* Account info */}
-        <div className="bg-white rounded-xl border border-gray-100 p-6">
-          <h2 className="font-semibold text-gray-900 mb-4">Account</h2>
-          <div className="text-sm text-gray-600 mb-4">
-            <span className="text-gray-400">Signed in as</span> {user?.email}
+        {/* Account */}
+        <div style={{ background: "rgba(255,255,255,0.04)", border: "1px solid rgba(255,255,255,0.08)", borderRadius: 18, padding: 24 }}>
+          <h2 style={{ fontSize: 15, fontWeight: 600, color: "#f5f5f7", marginBottom: 16 }}>Account</h2>
+          <div style={{ fontSize: 13, color: "rgba(245,245,247,0.4)", marginBottom: 16 }}>
+            Signed in as <span style={{ color: "#f5f5f7" }}>{user?.email}</span>
           </div>
-          <button onClick={handleLogout}
-            className="text-red-600 text-sm font-medium hover:text-red-700 border border-red-200 px-4 py-2 rounded-lg hover:bg-red-50">
+          <button onClick={async () => { await signOut(auth); router.push("/"); }} style={{ background: "rgba(255,69,58,0.1)", border: "1px solid rgba(255,69,58,0.3)", color: "#ff453a", fontSize: 13, fontWeight: 500, padding: "9px 18px", borderRadius: 8, cursor: "pointer", fontFamily: "inherit" }}>
             Sign out
           </button>
         </div>

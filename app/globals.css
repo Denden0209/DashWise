@@ -1,26 +1,279 @@
-@import "tailwindcss";
+/* globals.css — DashWise dark theme */
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg:        #000000;
+  --bg-2:      #0a0a0a;
+  --bg-3:      #111111;
+  --bg-4:      #1a1a1a;
+  --border:    rgba(255,255,255,0.08);
+  --border-2:  rgba(255,255,255,0.12);
+  --text:      #f5f5f7;
+  --text-2:    rgba(245,245,247,0.72);
+  --text-3:    rgba(245,245,247,0.4);
+  --blue:      #2997ff;
+  --blue-dim:  rgba(41,151,255,0.12);
+  --green:     #30d158;
+  --red:       #ff453a;
+  --amber:     #ffd60a;
+  --radius:    14px;
+  --radius-sm: 10px;
+  --radius-lg: 20px;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
-}
+* { box-sizing: border-box; margin: 0; padding: 0; }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+html {
+  scroll-behavior: smooth;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, BlinkMacSystemFont, "SF Pro Display",
+               "SF Pro Text", "Helvetica Neue", Arial, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+  min-height: 100vh;
 }
+
+/* Scrollbar */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(255,255,255,0.25); }
+
+/* Selection */
+::selection { background: rgba(41,151,255,0.3); color: #fff; }
+
+/* Focus rings */
+*:focus-visible {
+  outline: 2px solid var(--blue);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+
+/* Links */
+a { color: inherit; text-decoration: none; }
+
+/* ── Utility classes ──────────────────────────────────── */
+
+/* Cards */
+.dw-card {
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+}
+
+.dw-card-hover {
+  transition: all 0.2s ease;
+}
+.dw-card-hover:hover {
+  background: var(--bg-4);
+  border-color: var(--border-2);
+  transform: translateY(-1px);
+}
+
+/* Inputs */
+.dw-input {
+  background: rgba(255,255,255,0.06) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-sm) !important;
+  color: var(--text) !important;
+  font-size: 14px !important;
+  padding: 10px 14px !important;
+  transition: border-color 0.2s !important;
+  width: 100% !important;
+}
+.dw-input::placeholder { color: var(--text-3) !important; }
+.dw-input:focus {
+  outline: none !important;
+  border-color: var(--blue) !important;
+  background: rgba(255,255,255,0.08) !important;
+}
+
+/* Buttons */
+.dw-btn {
+  border-radius: 980px;
+  font-weight: 600;
+  font-size: 14px;
+  padding: 10px 22px;
+  transition: all 0.2s;
+  cursor: pointer;
+  border: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  letter-spacing: -0.1px;
+}
+.dw-btn-primary {
+  background: var(--blue);
+  color: #fff;
+}
+.dw-btn-primary:hover { background: #0077ed; }
+.dw-btn-primary:disabled { opacity: 0.4; cursor: not-allowed; }
+
+.dw-btn-secondary {
+  background: rgba(255,255,255,0.08);
+  color: var(--text);
+  border: 1px solid var(--border);
+}
+.dw-btn-secondary:hover {
+  background: rgba(255,255,255,0.12);
+  border-color: var(--border-2);
+}
+
+.dw-btn-ghost {
+  background: transparent;
+  color: var(--text-2);
+  border: 1px solid var(--border);
+}
+.dw-btn-ghost:hover { color: var(--text); border-color: var(--border-2); }
+
+/* Badges */
+.dw-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 3px 10px;
+  border-radius: 20px;
+  letter-spacing: 0.1px;
+}
+.dw-badge-blue   { background: rgba(41,151,255,0.15); color: #2997ff; }
+.dw-badge-green  { background: rgba(48,209,88,0.15);  color: #30d158; }
+.dw-badge-red    { background: rgba(255,69,58,0.15);   color: #ff453a; }
+.dw-badge-amber  { background: rgba(255,214,10,0.15);  color: #ffd60a; }
+.dw-badge-gray   { background: rgba(255,255,255,0.08); color: var(--text-3); }
+
+/* Section labels */
+.dw-label {
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  color: var(--text-3);
+  margin-bottom: 10px;
+}
+
+/* Divider */
+.dw-divider { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+
+/* Sidebar */
+.dw-sidebar {
+  background: rgba(255,255,255,0.02);
+  border-right: 1px solid var(--border);
+}
+
+/* Page container */
+.dw-page { max-width: 1100px; margin: 0 auto; padding: 32px 24px; }
+
+/* Alert boxes */
+.dw-alert {
+  border-radius: var(--radius-sm);
+  padding: 12px 16px;
+  font-size: 13px;
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  border: 1px solid;
+}
+.dw-alert-error  { background: rgba(255,69,58,0.1);  border-color: rgba(255,69,58,0.3);  color: #ff6b62; }
+.dw-alert-success{ background: rgba(48,209,88,0.1);  border-color: rgba(48,209,88,0.3);  color: #30d158; }
+.dw-alert-info   { background: rgba(41,151,255,0.1); border-color: rgba(41,151,255,0.3); color: #2997ff; }
+.dw-alert-warn   { background: rgba(255,214,10,0.1); border-color: rgba(255,214,10,0.3); color: #ffd60a; }
+
+/* Table */
+.dw-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.dw-table th {
+  background: rgba(255,255,255,0.04);
+  padding: 10px 16px;
+  text-align: left;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--text-3);
+  border-bottom: 1px solid var(--border);
+}
+.dw-table td {
+  padding: 12px 16px;
+  border-bottom: 1px solid rgba(255,255,255,0.04);
+  color: var(--text-2);
+}
+.dw-table tr:hover td { background: rgba(255,255,255,0.02); }
+.dw-table tr:last-child td { border-bottom: none; }
+
+/* Select */
+.dw-select {
+  background: rgba(255,255,255,0.06) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-sm) !important;
+  color: var(--text) !important;
+  font-size: 14px !important;
+  padding: 10px 14px !important;
+  width: 100% !important;
+  cursor: pointer !important;
+  appearance: none !important;
+}
+.dw-select:focus {
+  outline: none !important;
+  border-color: var(--blue) !important;
+}
+
+/* Textarea */
+.dw-textarea {
+  background: rgba(255,255,255,0.06) !important;
+  border: 1px solid var(--border) !important;
+  border-radius: var(--radius-sm) !important;
+  color: var(--text) !important;
+  font-size: 14px !important;
+  padding: 12px 14px !important;
+  resize: vertical !important;
+  width: 100% !important;
+  font-family: inherit !important;
+}
+.dw-textarea:focus {
+  outline: none !important;
+  border-color: var(--blue) !important;
+}
+
+/* Override Tailwind defaults for dark theme */
+input, textarea, select {
+  background: rgba(255,255,255,0.06);
+  border: 1px solid rgba(255,255,255,0.08);
+  color: #f5f5f7;
+  border-radius: 10px;
+  padding: 10px 14px;
+}
+input::placeholder,
+textarea::placeholder { color: rgba(245,245,247,0.3); }
+input:focus, textarea:focus, select:focus {
+  outline: none;
+  border-color: #2997ff;
+  background: rgba(255,255,255,0.08);
+}
+select option { background: #1a1a1a; color: #f5f5f7; }
+
+button {
+  cursor: pointer;
+  font-family: inherit;
+}
+
+/* Spinner animation */
+@keyframes spin { to { transform: rotate(360deg); } }
+.dw-spin { animation: spin 0.8s linear infinite; }
+
+/* Fade in */
+@keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: translateY(0); } }
+.dw-fade-in { animation: fadeIn 0.3s ease forwards; }
+
+/* Pulse dot */
+@keyframes pulse { 0%,100% { opacity:1; } 50% { opacity:0.4; } }
+.dw-pulse { animation: pulse 2s infinite; }
