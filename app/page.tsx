@@ -370,13 +370,12 @@ export default function LandingPage() {
               </div>
               <div style={{ direction: "ltr" }}>
                 <div style={{
-                  background: "rgba(255,255,255,0.04)",
+                  background: `radial-gradient(ellipse at center, rgba(41,151,255,0.08) 0%, transparent 70%)`,
                   border: "1px solid rgba(255,255,255,0.08)",
                   borderRadius: 24, padding: 48,
                   display: "flex", alignItems: "center", justifyContent: "center",
                   minHeight: 280,
                   fontSize: 80,
-                  background: `radial-gradient(ellipse at center, rgba(41,151,255,0.08) 0%, transparent 70%)`,
                 }}>
                   {f.icon}
                 </div>
