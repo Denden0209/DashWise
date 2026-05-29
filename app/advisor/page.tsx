@@ -155,12 +155,10 @@ function AdvisorInner() {
               )}
               <div style={{
                 maxWidth:520, padding:"12px 16px", borderRadius:16, fontSize:13,
-                background:   msg.role==="user" ? C.blue : C.surface,
-                color:        msg.role==="user" ? "#fff" : C.text,
-                borderBottomRight: msg.role==="user" ? "4px" : undefined,
-                borderBottomLeft:  msg.role==="assistant" ? "4px" : undefined,
-                boxShadow:    msg.role==="assistant" ? shadow.sm : "none",
-                border:       msg.role==="assistant" ? `1px solid ${C.border}` : "none",
+                background:              msg.role==="user" ? C.blue : C.surface,
+                color:                   msg.role==="user" ? "#fff" : C.text,
+                boxShadow:               msg.role==="assistant" ? shadow.sm : "none",
+                border:                  msg.role==="assistant" ? `1px solid ${C.border}` : "none",
                 borderBottomRightRadius: msg.role==="user" ? 4 : 16,
                 borderBottomLeftRadius:  msg.role==="assistant" ? 4 : 16,
               }}>
