@@ -1,456 +1,396 @@
 "use client";
-// app/files/page.tsx — FILE FOLDER MANAGER
-// Stores parsed file content directly in Firestore.
-// No Firebase Storage required — works on all Firebase plans.
-
-import { useState, useEffect, useRef, useCallback } from "react";
-import Link from "next/link";
+import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
-import Nav from "@/components/Nav";
-import AnalysisDashboard, { DashboardData } from "@/components/AnalysisDashboard";
-
+import Link from "next/link";
 import { useAuth } from "@/lib/AuthContext";
 import {
-  createFolder, getUserFolders, addFileToFolder,
-  getFolderFiles, saveFolderAnalysis,
+  getUserFolders, createFolder, getFolderFiles,
+  addFileToFolder, updateFileRecord,
+  saveFolderAnalysis,
   BusinessFolder, FolderFile,
 } from "@/lib/db";
+import Nav from "@/components/Nav";
+import { C, radius, shadow, btnPrimary } from "@/lib/styles";
 
-const ACCEPTED = ".csv,.xlsx,.xls,.xlsm,.pdf,.txt,.json";
-const FILE_ICONS: Record<string, string> = {
-  csv: "📊", xlsx: "📗", xls: "📗", xlsm: "📗",
-  pdf: "📄", txt:  "📝", json: "🔧", default: "📎",
-};
 const MODES = [
-  { id: "explain", icon: "💡", label: "Full Report",  desc: "Complete consolidated analysis" },
-  { id: "meeting", icon: "🗓️", label: "Meeting Prep", desc: "Briefing from all files" },
-  { id: "anomaly", icon: "🔍", label: "Find Issues",  desc: "Anomalies across all data" },
-  { id: "action",  icon: "⚡", label: "Action Plan",  desc: "What to do based on all data" },
+  { id:"explain", icon:"💡", label:"Full Report",   desc:"Overall analysis of all files" },
+  { id:"meeting", icon:"🗓️", label:"Meeting Prep",  desc:"Key talking points with numbers" },
+  { id:"anomaly", icon:"🔍", label:"Find Issues",   desc:"Flag problems and anomalies" },
+  { id:"action",  icon:"⚡", label:"Action Plan",   desc:"Specific steps to take now" },
 ];
 
-function getIcon(name: string) {
-  const ext = name.split(".").pop()?.toLowerCase() || "default";
-  return FILE_ICONS[ext] || FILE_ICONS.default;
-}
-function fmtSize(bytes: number) {
-  if (bytes < 1024)        return bytes + " B";
-  if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + " KB";
-  return (bytes / (1024 * 1024)).toFixed(1) + " MB";
+function Spinner({ size=20, color=C.blue }: { size?: number; color?: string }) {
+  return (
+    <div style={{ width:size, height:size, border:`2px solid ${color}30`, borderTopColor:color, borderRadius:"50%", animation:"spin .7s linear infinite", flexShrink:0 }}/>
+  );
 }
 
 export default function FilesPage() {
-  const { user, profile } = useAuth();
-  const router = useRouter();
-
-  const [folders,      setFolders]      = useState<BusinessFolder[]>([]);
-  const [activeFolder, setActiveFolder] = useState<BusinessFolder | null>(null);
-  const [folderFiles,  setFolderFiles]  = useState<FolderFile[]>([]);
-  const [uploading,    setUploading]    = useState(false);
-  const [uploadStatus, setUploadStatus] = useState<Record<string, "uploading"|"parsing"|"done"|"error">>({});
-  const [analyzing,    setAnalyzing]    = useState(false);
-  const [analysis,     setAnalysis]     = useState<string | null>(null);
-  const [dashData,     setDashData]     = useState<DashboardData | null>(null);
-  const [mode,         setMode]         = useState("explain");
-  const [isDragging,   setIsDragging]   = useState(false);
-  const [showNew,      setShowNew]      = useState(false);
-  const [newName,      setNewName]      = useState("");
-  const [errorMsg,     setErrorMsg]     = useState("");
-  const [dashReady,    setDashReady]    = useState(false);
+  const router    = useRouter();
+  const { user, profile, loading } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  const [folders,        setFolders]        = useState<BusinessFolder[]>([]);
+  const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
+  const [files,          setFiles]          = useState<FolderFile[]>([]);
+  const [newFolderName,  setNewFolderName]  = useState("");
+  const [creatingFolder, setCreatingFolder] = useState(false);
+  const [showNewFolder,  setShowNewFolder]  = useState(false);
+  const [uploading,      setUploading]      = useState(false);
+  const [mode,           setMode]           = useState("explain");
+  const [analyzing,      setAnalyzing]      = useState(false);
+  const [analysis,       setAnalysis]       = useState<string | null>(null);
+  const [dashData,       setDashData]       = useState<unknown>(null);
+  const [dashReady,      setDashReady]      = useState(false);
+  const [errorMsg,       setErrorMsg]       = useState("");
+
   useEffect(() => {
-    if (user) loadFolders();
-  }, [user]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!loading && !user) router.push("/login");
+  }, [user, loading, router]);
 
-  async function loadFolders() {
+  useEffect(() => {
     if (!user) return;
-    const list = await getUserFolders(user.uid);
-    setFolders(list);
-    if (list.length > 0 && !activeFolder) openFolder(list[0]);
-  }
+    getUserFolders(user.uid).then(list => {
+      setFolders(list);
+      if (list.length > 0 && !activeFolderId) setActiveFolderId(list[0].id!);
+    });
+  }, [user]);
 
-  async function openFolder(folder: BusinessFolder) {
-    setActiveFolder(folder);
-    setAnalysis(null);
-    setErrorMsg("");
-    if (!user || !folder.id) return;
-    const files = await getFolderFiles(user.uid, folder.id);
-    setFolderFiles(files);
-  }
+  useEffect(() => {
+    if (!user || !activeFolderId) return;
+    setFiles([]); setAnalysis(null); setDashData(null); setDashReady(false);
+    getFolderFiles(user.uid, activeFolderId).then(setFiles);
+  }, [user, activeFolderId]);
 
   async function handleCreateFolder() {
-    if (!user || !newName.trim()) return;
-    const id = await createFolder(user.uid, {
-      bizName:   newName.trim(),
-      bizType:   profile?.bizType || "retail",
-      fileCount: 0,
-    });
-    const f: BusinessFolder = { id, bizName: newName.trim(), bizType: profile?.bizType || "retail", fileCount: 0 };
-    setFolders(prev => [f, ...prev]);
-    setActiveFolder(f);
-    setFolderFiles([]);
-    setShowNew(false);
-    setNewName("");
-    setAnalysis(null);
+    if (!newFolderName.trim() || !user) return;
+    setCreatingFolder(true);
+    const id = await createFolder(user.uid, newFolderName.trim(), profile?.bizType);
+    const updated = await getUserFolders(user.uid);
+    setFolders(updated);
+    setActiveFolderId(id);
+    setNewFolderName("");
+    setShowNewFolder(false);
+    setCreatingFolder(false);
   }
 
-  // ── Upload + parse files ───────────────────────────────
-  const handleFiles = useCallback(async (fileList: FileList | null) => {
-    if (!fileList || !user || !activeFolder?.id) return;
-    setUploading(true);
-    setErrorMsg("");
-
-    for (const file of Array.from(fileList)) {
-      const key = `${Date.now()}-${file.name}`;
-      setUploadStatus(p => ({ ...p, [key]: "uploading" }));
-
+  async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
+    const selectedFiles = e.target.files;
+    if (!selectedFiles || !user || !activeFolderId) return;
+    setUploading(true); setErrorMsg("");
+    for (const file of Array.from(selectedFiles)) {
+      const fileId = await addFileToFolder(user.uid, activeFolderId, {
+        name: file.name, size: file.size,
+        type: file.name.split(".").pop()?.toLowerCase() || "unknown",
+        status: "uploading",
+      });
       try {
-        // Parse file via API
-        setUploadStatus(p => ({ ...p, [key]: "parsing" }));
-        const fd = new FormData();
-        fd.append("file", file);
-
-        const res  = await fetch("/api/parse-files", { method: "POST", body: fd });
-
-        // Check if we got JSON back
-        const contentType = res.headers.get("content-type") || "";
-        if (!contentType.includes("application/json")) {
-          const text = await res.text();
-          console.error("Non-JSON response:", text.slice(0, 200));
-          throw new Error("Server error — check your terminal for details");
-        }
-
+        const form = new FormData();
+        form.append("file", file);
+        const res  = await fetch("/api/parse-files", { method:"POST", body:form });
         const data = await res.json();
-        if (!data.success) throw new Error(data.error || "Parse failed");
-
-        // Save to Firestore (no Firebase Storage needed)
-        const record: Omit<FolderFile, "id"> = {
-          name:           file.name,
-          size:           file.size,
-          type:           file.name.split(".").pop()?.toLowerCase() || "unknown",
-          storagePath:    "",          // empty — not using Storage
-          downloadURL:    "",          // empty — not using Storage
-          parsedContent:  data.content || "",
-          sheets:         data.sheets  || [],
-          rowCount:       data.rowCount || 0,
-          status:         "ready",
-        };
-
-        const newId = await addFileToFolder(user.uid, activeFolder.id, record);
-        setFolderFiles(prev => [{ id: newId, ...record }, ...prev]);
-        setUploadStatus(p => ({ ...p, [key]: "done" }));
-
-      } catch (err: unknown) {
-        console.error("Upload error:", err);
-        setErrorMsg(err instanceof Error ? err.message : "Upload failed");
-        setUploadStatus(p => ({ ...p, [key]: "error" }));
+        await updateFileRecord(user.uid, activeFolderId, fileId, {
+          parsedContent: data.content || "",
+          sheets:        data.sheets  || [],
+          rowCount:      data.rowCount || 0,
+          status:        "ready",
+        });
+      } catch {
+        await updateFileRecord(user.uid, activeFolderId, fileId, { status:"error" });
       }
     }
-
+    const updated = await getFolderFiles(user.uid, activeFolderId);
+    setFiles(updated);
     setUploading(false);
-    loadFolders();
-  }, [user, activeFolder]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (fileInputRef.current) fileInputRef.current.value = "";
+  }
 
-  const handleDrop = useCallback((e: React.DragEvent) => {
-    e.preventDefault();
-    setIsDragging(false);
-    handleFiles(e.dataTransfer.files);
-  }, [handleFiles]);
-
-  // ── Analyze all files ──────────────────────────────────
   async function handleAnalyzeAll() {
-    if (!user || !activeFolder?.id) return;
-    const ready = folderFiles.filter(f => f.status === "ready" && f.parsedContent);
+    if (!user || !activeFolderId) return;
+    const ready = files.filter(f => f.status === "ready");
     if (ready.length === 0) return;
+    setAnalyzing(true); setAnalysis(null); setDashData(null); setDashReady(false); setErrorMsg("");
 
-    setAnalyzing(true);
-    setAnalysis(null);
-    setErrorMsg("");
+    const filePayloads = ready.map(f => ({
+      fileName: f.name, fileType: f.type,
+      content:  (f.parsedContent || "").slice(0, 8000),
+      sheets:   f.sheets || [],
+    }));
 
     try {
-      const res  = await fetch("/api/analyze-folder", {
-        method:  "POST",
-        headers: { "Content-Type": "application/json" },
+      const res = await fetch("/api/analyze-folder", {
+        method:"POST",
+        headers:{ "Content-Type":"application/json" },
         body: JSON.stringify({
-          files:        ready.map(f => ({
-            fileName: f.name,
-            fileType: f.type,
-            content:  f.parsedContent || "",
-            sheets:   f.sheets || [],
-          })),
+          files:        filePayloads,
           businessType: profile?.bizType || "retail",
-          bizName:      activeFolder.bizName,
+          bizName:      activeFolder?.bizName || profile?.bizName || "My Business",
           mode,
           goals:        profile?.goals || [],
         }),
       });
-
-      const contentType = res.headers.get("content-type") || "";
-      if (!contentType.includes("application/json")) {
-        throw new Error("Server error analyzing files — check terminal");
-      }
-
+      if (!res.ok) throw new Error("Server error");
       const data = await res.json();
-      if (!data.success) throw new Error(data.error || "Analysis failed");
-
-      setAnalysis(data.analysis);
+      setAnalysis(data.analysis || "");
       setDashData(data.dashboardData || null);
       setDashReady(true);
-      // Save to sessionStorage so dashboard-view page can read it
+      if (data.dashboardData?.summary) {
+        await saveFolderAnalysis(user.uid, activeFolderId, data.dashboardData.summary.slice(0, 300));
+      }
       try {
         sessionStorage.setItem("dashwise-analysis", JSON.stringify({
           dashboardData: data.dashboardData,
-          narrative: data.analysis,
-          bizName: activeFolder?.bizName || "",
+          narrative:     data.analysis,
+          bizName:       activeFolder?.bizName || profile?.bizName || "My Business",
           mode,
         }));
-      } catch (e) { console.error("sessionStorage error:", e); }
-      await saveFolderAnalysis(user.uid, activeFolder.id, data.analysis.slice(0, 300));
-
+      } catch {}
     } catch (err: unknown) {
-      setErrorMsg(err instanceof Error ? err.message : "Analysis failed");
-    } finally {
-      setAnalyzing(false);
-    }
+      setErrorMsg(err instanceof Error ? err.message : "Analysis failed. Please try again.");
+    } finally { setAnalyzing(false); }
   }
 
-  // ── Render analysis text ───────────────────────────────
+  const activeFolder  = folders.find(f => f.id === activeFolderId);
+  const readyFiles    = files.filter(f => f.status === "ready");
+  const uploadingFiles = files.filter(f => f.status === "uploading");
+
   function renderAnalysis(text: string) {
     return text.split("\n").map((line, i) => {
-      if (!line.trim()) return <div key={i} className="h-1" />;
+      if (!line.trim()) return <div key={i} style={{ height:8 }}/>;
       if (line.startsWith("**") && line.endsWith("**"))
-        return <div key={i} className="font-bold text-gray-900 text-base mt-5 mb-2 pb-1 border-b border-gray-100">{line.replace(/\*\*/g, "")}</div>;
+        return <div key={i} style={{ fontWeight:700, color:C.text, fontSize:14, marginTop:16, marginBottom:6, paddingBottom:6, borderBottom:`1px solid ${C.border}` }}>{line.replace(/\*\*/g,"")}</div>;
       if (line.match(/\*\*(.*?)\*\*/))
-        return <div key={i} className="text-sm text-gray-700 mb-1 leading-relaxed"
-          dangerouslySetInnerHTML={{ __html: line.replace(/\*\*(.*?)\*\*/g, "<strong>$1</strong>") }}/>;
-      if (line.match(/^[🚨⚠️✅❓🔍]/))
-        return <div key={i} className="font-semibold text-gray-900 mt-4 mb-1 text-sm">{line}</div>;
-      if (line.startsWith("- ") || line.startsWith("• "))
-        return <div key={i} className="text-sm text-gray-600 pl-3 py-0.5 border-l-2 border-gray-200 ml-1 mb-1">{line.replace(/^[-•]\s/, "")}</div>;
-      return <div key={i} className="text-sm text-gray-700 leading-relaxed mb-1">{line}</div>;
+        return <div key={i} style={{ fontSize:13, color:C.text2, lineHeight:1.6, marginBottom:4 }} dangerouslySetInnerHTML={{ __html: line.replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>") }}/>;
+      return <div key={i} style={{ fontSize:13, color:C.text2, lineHeight:1.6, marginBottom:4 }}>{line}</div>;
     });
   }
 
-  const readyCount = folderFiles.filter(f => f.status === "ready").length;
+  if (loading) return (
+    <div style={{ minHeight:"100vh", background:C.bg, display:"flex", alignItems:"center", justifyContent:"center" }}>
+      <Spinner size={32}/><style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
+    </div>
+  );
 
   return (
-    <div className="min-h-screen bg-gray-50">
-      <Nav />
+    <div style={{ minHeight:"100vh", background:C.bg }}>
+      <Nav/>
+      <div style={{ display:"flex", height:"calc(100vh - 52px)" }}>
 
-      <div className="max-w-6xl mx-auto px-6 py-6 flex gap-6">
-
-        {/* ── Sidebar — Folders ── */}
-        <aside className="w-60 flex-shrink-0">
-          <div className="flex items-center justify-between mb-3">
-            <h2 className="font-bold text-gray-900 text-sm">My Folders</h2>
-            <button onClick={() => { setShowNew(true); setNewName(profile?.bizName || ""); }}
-              className="text-xs bg-blue-600 text-white px-2.5 py-1.5 rounded-lg hover:bg-blue-700 font-semibold">
-              + New
-            </button>
-          </div>
-
-          {showNew && (
-            <div className="bg-white border border-blue-200 rounded-xl p-3 mb-3 shadow-sm">
-              <input
-                autoFocus
-                value={newName}
-                onChange={e => setNewName(e.target.value)}
-                onKeyDown={e => e.key === "Enter" && handleCreateFolder()}
-                placeholder="Business name..."
-                className="w-full border border-gray-300 rounded-lg px-3 py-2 text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 mb-2"
-              />
-              <div className="flex gap-2">
-                <button onClick={handleCreateFolder} className="flex-1 bg-blue-600 text-white text-xs font-bold py-1.5 rounded-lg hover:bg-blue-700">Create</button>
-                <button onClick={() => setShowNew(false)} className="flex-1 border border-gray-200 text-xs text-gray-600 py-1.5 rounded-lg hover:bg-gray-50">Cancel</button>
-              </div>
-            </div>
-          )}
-
-          <div className="space-y-1">
-            {folders.length === 0 && (
-              <div className="text-center py-8 text-gray-400 text-xs">No folders yet.<br/>Click + New to start.</div>
-            )}
-            {folders.map(f => (
-              <button key={f.id} onClick={() => openFolder(f)}
-                className={`w-full text-left px-3 py-3 rounded-xl transition-all ${
-                  activeFolder?.id === f.id
-                    ? "bg-blue-600 text-white"
-                    : "bg-white border border-gray-100 hover:border-gray-300"
-                }`}>
-                <div className="flex items-center gap-2">
-                  <span className="text-lg">📁</span>
-                  <div className="min-w-0">
-                    <div className={`font-semibold text-sm truncate ${activeFolder?.id === f.id ? "text-white" : "text-gray-900"}`}>{f.bizName}</div>
-                    <div className={`text-xs ${activeFolder?.id === f.id ? "text-blue-200" : "text-gray-400"}`}>{f.fileCount} file{f.fileCount !== 1 ? "s" : ""}</div>
-                  </div>
-                </div>
+        {/* ── Sidebar ── */}
+        <div style={{ width:260, flexShrink:0, borderRight:`1px solid ${C.border}`, background:C.surface, display:"flex", flexDirection:"column", overflow:"hidden" }}>
+          <div style={{ padding:"16px 16px 12px", borderBottom:`1px solid ${C.border}` }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
+              <span style={{ fontSize:11, fontWeight:600, textTransform:"uppercase" as const, letterSpacing:"0.8px", color:C.text3 }}>Folders</span>
+              <button onClick={()=>setShowNewFolder(!showNewFolder)} style={{ background:C.blueBg, border:`1px solid ${C.blueMid}`, color:C.blue, fontSize:11, fontWeight:600, padding:"4px 10px", borderRadius:6, cursor:"pointer" }}>
+                + New
               </button>
-            ))}
+            </div>
+            {showNewFolder && (
+              <div style={{ display:"flex", gap:6 }}>
+                <input
+                  autoFocus
+                  value={newFolderName}
+                  onChange={e=>setNewFolderName(e.target.value)}
+                  onKeyDown={e=>{ if(e.key==="Enter") handleCreateFolder(); if(e.key==="Escape") setShowNewFolder(false); }}
+                  placeholder="Folder name..."
+                  style={{ flex:1, background:C.bg, border:`1px solid ${C.border}`, borderRadius:6, padding:"7px 10px", fontSize:13, color:C.text, outline:"none" }}
+                />
+                <button onClick={handleCreateFolder} disabled={!newFolderName.trim()||creatingFolder} style={{ ...btnPrimary, padding:"7px 12px", borderRadius:6, fontSize:12 }}>
+                  {creatingFolder ? "..." : "Add"}
+                </button>
+              </div>
+            )}
           </div>
-        </aside>
 
-        {/* ── Main content ── */}
-        <main className="flex-1 min-w-0">
-          {!activeFolder ? (
-            <div className="bg-white rounded-2xl border border-gray-100 flex flex-col items-center justify-center py-20 text-center">
-              <div className="text-5xl mb-4">📁</div>
-              <h3 className="font-bold text-gray-900 text-lg mb-2">Create your first folder</h3>
-              <p className="text-gray-500 text-sm mb-6 max-w-xs">Each folder is a business. Upload CSV, Excel, PDF files and analyze them all together.</p>
-              <button onClick={() => setShowNew(true)} className="bg-blue-600 text-white font-bold px-6 py-2.5 rounded-lg hover:bg-blue-700 text-sm">+ Create folder</button>
+          <div style={{ flex:1, overflowY:"auto", padding:8 }}>
+            {folders.length === 0 ? (
+              <div style={{ padding:"20px 12px", textAlign:"center", color:C.text3, fontSize:13 }}>
+                No folders yet. Create one to start uploading.
+              </div>
+            ) : (
+              folders.map(folder => {
+                const active = activeFolderId === folder.id;
+                return (
+                  <button key={folder.id} onClick={()=>setActiveFolderId(folder.id!)} style={{
+                    width:"100%", display:"flex", alignItems:"center", gap:10,
+                    padding:"10px 12px", borderRadius:radius.sm, marginBottom:2,
+                    background: active ? C.blueBg : "transparent",
+                    border:     active ? `1px solid ${C.blueMid}` : "1px solid transparent",
+                    cursor:"pointer", textAlign:"left" as const,
+                  }}>
+                    <span style={{ fontSize:16, flexShrink:0 }}>📁</span>
+                    <div style={{ flex:1, minWidth:0 }}>
+                      <div style={{ fontSize:13, fontWeight: active?600:400, color: active?C.blue:C.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                        {folder.bizName}
+                      </div>
+                      <div style={{ fontSize:11, color:C.text3 }}>{folder.fileCount} file{folder.fileCount!==1?"s":""}</div>
+                    </div>
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </div>
+
+        {/* ── Main panel ── */}
+        <div style={{ flex:1, overflowY:"auto", padding:"28px 32px" }}>
+          {!activeFolderId ? (
+            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", textAlign:"center" }}>
+              <div style={{ fontSize:52, marginBottom:16 }}>📂</div>
+              <h2 style={{ fontSize:20, fontWeight:700, color:C.text, marginBottom:8 }}>No folder selected</h2>
+              <p style={{ fontSize:14, color:C.text3 }}>Create a folder in the sidebar to get started.</p>
             </div>
           ) : (
-            <div>
-              {/* Header */}
-              <div className="flex items-center justify-between mb-4">
-                <div>
-                  <h1 className="text-xl font-bold text-gray-900">📁 {activeFolder.bizName}</h1>
-                  <p className="text-gray-400 text-xs mt-0.5">{folderFiles.length} file{folderFiles.length !== 1 ? "s" : ""} · {readyCount} ready</p>
-                </div>
+            <div style={{ maxWidth:800 }}>
+
+              {/* Folder header */}
+              <div style={{ marginBottom:24 }}>
+                <h1 style={{ fontSize:26, fontWeight:700, letterSpacing:"-0.5px", color:C.text, marginBottom:4 }}>{activeFolder?.bizName}</h1>
+                <p style={{ fontSize:13, color:C.text3 }}>{files.length} file{files.length!==1?"s":""} · {readyFiles.length} ready to analyze</p>
               </div>
 
-              {/* Error message */}
+              {/* Error */}
               {errorMsg && (
-                <div className="bg-red-50 border border-red-200 text-red-700 text-sm px-4 py-3 rounded-xl mb-4 flex items-start gap-2">
-                  <span className="flex-shrink-0">⚠️</span>
-                  <span>{errorMsg}</span>
-                  <button onClick={() => setErrorMsg("")} className="ml-auto text-red-400 hover:text-red-600">✕</button>
+                <div style={{ background:C.redBg, border:`1px solid #ffd6d6`, color:C.red, fontSize:13, padding:"12px 16px", borderRadius:radius.sm, marginBottom:20, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
+                  {errorMsg}
+                  <button onClick={()=>setErrorMsg("")} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:16 }}>×</button>
                 </div>
               )}
 
               {/* Upload zone */}
               <div
-                className={`border-2 border-dashed rounded-2xl transition-all mb-4 cursor-pointer ${
-                  isDragging ? "border-blue-500 bg-blue-50" : "border-gray-300 bg-white hover:border-gray-400"
-                }`}
-                onDrop={handleDrop}
-                onDragOver={e => { e.preventDefault(); setIsDragging(true); }}
-                onDragLeave={() => setIsDragging(false)}
-                onClick={() => fileInputRef.current?.click()}
+                onClick={()=>fileInputRef.current?.click()}
+                style={{ background:C.surface, border:`2px dashed ${C.border2}`, borderRadius:radius.lg, padding:"32px 24px", textAlign:"center", cursor:"pointer", marginBottom:20, transition:"border-color 0.2s" }}
+                onMouseEnter={e=>(e.currentTarget as HTMLElement).style.borderColor=C.blue}
+                onMouseLeave={e=>(e.currentTarget as HTMLElement).style.borderColor=C.border2}
               >
-                <div className="flex flex-col items-center justify-center py-10 text-center pointer-events-none">
-                  <div className="text-4xl mb-3">{uploading ? "⏳" : "☁️"}</div>
-                  <div className="font-semibold text-gray-700 mb-1">
-                    {uploading ? "Uploading and parsing files..." : "Drop files here or click to browse"}
+                <input ref={fileInputRef} type="file" multiple accept=".csv,.xlsx,.xls,.xlsm,.pdf,.txt,.json" onChange={handleUpload} style={{ display:"none" }}/>
+                {uploading ? (
+                  <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12 }}>
+                    <Spinner/>
+                    <span style={{ fontSize:14, color:C.text2 }}>Uploading and parsing files...</span>
                   </div>
-                  <div className="text-xs text-gray-400">CSV · Excel (all sheets) · PDF · TXT · JSON · Multiple files at once</div>
-                </div>
-                <input ref={fileInputRef} type="file" multiple accept={ACCEPTED} className="hidden"
-                  onChange={e => handleFiles(e.target.files)}/>
+                ) : (
+                  <>
+                    <div style={{ fontSize:32, marginBottom:10 }}>⬆️</div>
+                    <div style={{ fontWeight:600, fontSize:15, color:C.text, marginBottom:4 }}>Drop files here or click to browse</div>
+                    <div style={{ fontSize:13, color:C.text3 }}>CSV, Excel, PDF, TXT, JSON supported</div>
+                  </>
+                )}
               </div>
 
-              {/* Upload progress */}
-              {Object.entries(uploadStatus).filter(([,v]) => v !== "done").length > 0 && (
-                <div className="space-y-1 mb-4">
-                  {Object.entries(uploadStatus).filter(([,v]) => v !== "done" && v !== "error").map(([key, status]) => (
-                    <div key={key} className="bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 text-xs text-blue-700 flex items-center gap-2">
-                      <div className="w-3 h-3 border-2 border-blue-600 border-t-transparent rounded-full animate-spin flex-shrink-0"/>
-                      {status === "uploading" ? "Uploading..." : "Parsing file content..."}
+              {/* File list */}
+              {files.length > 0 && (
+                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, overflow:"hidden", boxShadow:shadow.sm, marginBottom:20 }}>
+                  {files.map((file, i) => (
+                    <div key={file.id||i} style={{ display:"flex", alignItems:"center", gap:12, padding:"12px 18px", borderBottom:i<files.length-1?`1px solid #f9f9fb`:"none" }}>
+                      <span style={{ fontSize:20, flexShrink:0 }}>
+                        {{"csv":"📊","xlsx":"📗","xls":"📗","pdf":"📄","txt":"📝","json":"🔧"}[file.type]||"📎"}
+                      </span>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <div style={{ fontSize:13, fontWeight:500, color:C.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{file.name}</div>
+                        <div style={{ fontSize:11, color:C.text3, marginTop:2 }}>
+                          {(file.size/1024).toFixed(1)} KB
+                          {file.sheets?.length ? ` · ${file.sheets.length} sheets` : ""}
+                          {file.rowCount ? ` · ${file.rowCount} rows` : ""}
+                        </div>
+                      </div>
+                      {file.status === "uploading" ? (
+                        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
+                          <Spinner size={14}/>
+                          <span style={{ fontSize:11, color:C.text3 }}>Parsing...</span>
+                        </div>
+                      ) : (
+                        <span style={{ fontSize:11, fontWeight:600, padding:"3px 10px", borderRadius:20, background:file.status==="ready"?"#f0faf4":C.redBg, color:file.status==="ready"?"#34c759":C.red, border:`1px solid ${file.status==="ready"?"#c8f0d8":"#ffd6d6"}` }}>
+                          {file.status==="ready" ? "✓ Ready" : "Error"}
+                        </span>
+                      )}
                     </div>
                   ))}
                 </div>
               )}
 
-              {/* File list */}
-              {folderFiles.length > 0 && (
-                <div className="bg-white rounded-2xl border border-gray-100 mb-4 overflow-hidden">
-                  <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
-                    <span className="font-semibold text-gray-900 text-sm">Files</span>
-                    <span className="text-xs text-gray-400">{folderFiles.length} total · {readyCount} parsed</span>
+              {/* Analysis controls */}
+              {readyFiles.length > 0 && (
+                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, padding:20, boxShadow:shadow.sm, marginBottom:20 }}>
+                  <div style={{ fontSize:11, fontWeight:600, textTransform:"uppercase" as const, letterSpacing:"0.8px", color:C.text3, marginBottom:12 }}>
+                    Analysis Mode
                   </div>
-                  <div className="divide-y divide-gray-50">
-                    {folderFiles.map(file => (
-                      <div key={file.id} className="px-4 py-3 flex items-center gap-3">
-                        <span className="text-xl flex-shrink-0">{getIcon(file.name)}</span>
-                        <div className="flex-1 min-w-0">
-                          <div className="font-medium text-sm text-gray-900 truncate">{file.name}</div>
-                          <div className="text-xs text-gray-400 flex items-center gap-2 mt-0.5 flex-wrap">
-                            <span>{fmtSize(file.size)}</span>
-                            {file.sheets && file.sheets.length > 0 && (
-                              <span className="bg-green-50 text-green-700 px-1.5 py-0.5 rounded text-xs font-medium">
-                                {file.sheets.length} sheet{file.sheets.length !== 1 ? "s" : ""}: {file.sheets.slice(0,3).join(", ")}{file.sheets.length > 3 ? "..." : ""}
-                              </span>
-                            )}
-                            {(file.rowCount ?? 0) > 0 && <span>{file.rowCount} rows</span>}
-                          </div>
-                        </div>
-                        <span className={`text-xs px-2 py-0.5 rounded-full font-medium flex-shrink-0 ${
-                          file.status === "ready"
-                            ? "bg-green-50 text-green-700 border border-green-200"
-                            : file.status === "error"
-                            ? "bg-red-50 text-red-600"
-                            : "bg-blue-50 text-blue-600"
-                        }`}>
-                          {file.status === "ready" ? "✓ Ready" : file.status === "error" ? "Error" : "Processing..."}
-                        </span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-
-              {/* Analyze section */}
-              {readyCount > 0 && (
-                <div className="bg-white rounded-2xl border border-gray-100 p-5 mb-4">
-                  <h3 className="font-bold text-gray-900 mb-1">Analyze All Files Together</h3>
-                  <p className="text-gray-500 text-xs mb-4">
-                    Claude reads every file including all Excel sheets and cross-references them for a single consolidated report.
-                  </p>
-
-                  <div className="grid grid-cols-2 md:grid-cols-4 gap-2 mb-4">
+                  <div style={{ display:"grid", gridTemplateColumns:"repeat(2,1fr)", gap:8, marginBottom:16 }}>
                     {MODES.map(m => (
-                      <button key={m.id} onClick={() => setMode(m.id)}
-                        className={`p-3 rounded-xl border text-left transition-all ${mode === m.id ? "border-blue-600 bg-blue-50" : "border-gray-200 hover:border-gray-300"}`}>
-                        <div className="text-lg mb-1">{m.icon}</div>
-                        <div className={`text-xs font-bold ${mode === m.id ? "text-blue-700" : "text-gray-900"}`}>{m.label}</div>
-                        <div className="text-xs text-gray-400 mt-0.5 leading-tight">{m.desc}</div>
+                      <button key={m.id} onClick={()=>setMode(m.id)} style={{
+                        display:"flex", alignItems:"center", gap:10,
+                        padding:"12px 14px", borderRadius:radius.sm, cursor:"pointer",
+                        background: mode===m.id?C.blueBg:C.bg,
+                        border:     mode===m.id?`1.5px solid ${C.blue}`:`1px solid ${C.border}`,
+                        textAlign:"left" as const,
+                      }}>
+                        <span style={{ fontSize:20, flexShrink:0 }}>{m.icon}</span>
+                        <div>
+                          <div style={{ fontSize:13, fontWeight:600, color:mode===m.id?C.blue:C.text }}>{m.label}</div>
+                          <div style={{ fontSize:11, color:C.text3 }}>{m.desc}</div>
+                        </div>
                       </button>
                     ))}
                   </div>
 
-                  <button onClick={handleAnalyzeAll} disabled={analyzing}
-                    className="w-full bg-blue-600 text-white font-bold py-3 rounded-xl hover:bg-blue-700 disabled:opacity-40 text-sm flex items-center justify-center gap-2">
+                  <button onClick={handleAnalyzeAll} disabled={analyzing} style={{ ...btnPrimary, width:"100%", padding:"13px", borderRadius:radius.sm, fontSize:15, opacity:analyzing?.6:1 }}>
                     {analyzing ? (
-                      <><div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"/>Analyzing {readyCount} file{readyCount !== 1 ? "s" : ""}...</>
+                      <><Spinner size={16} color="#fff"/> Analyzing {readyFiles.length} file{readyFiles.length!==1?"s":""}...</>
                     ) : (
-                      `🧠 Analyze ${readyCount} file${readyCount !== 1 ? "s" : ""} together →`
+                      `🧠 Analyze ${readyFiles.length} file${readyFiles.length!==1?"s":""} together →`
                     )}
                   </button>
 
-                {/* View Full Dashboard button */}
-                {dashReady && (
-                  <button
-                    onClick={() => router.push("/dashboard-view")}
-                    className="w-full mt-2 font-bold py-3 rounded-xl text-sm flex items-center justify-center gap-2 transition-all"
-                    style={{ border: "2px solid #6366f1", color: "#818cf8", background: "transparent" }}
-                    onMouseEnter={e => { (e.target as HTMLElement).style.background = "#6366f1"; (e.target as HTMLElement).style.color = "white"; }}
-                    onMouseLeave={e => { (e.target as HTMLElement).style.background = "transparent"; (e.target as HTMLElement).style.color = "#818cf8"; }}>
-                    🚀 Open Full Dashboard View
-                  </button>
-                )}
+                  {dashReady && (
+                    <button onClick={()=>router.push("/dashboard-view")} style={{ ...btnPrimary, width:"100%", marginTop:10, padding:"13px", borderRadius:radius.sm, fontSize:14, background:"transparent", color:C.blue, border:`2px solid ${C.blue}` }}>
+                      🚀 Open Full Dashboard View
+                    </button>
+                  )}
                 </div>
               )}
 
-               {/* Analysis result — visual dashboard */}
-               {(analysis || dashData) && (
-                 <AnalysisDashboard
-                   data={dashData || {}}
-                   narrative={analysis || ""}
-                   bizName={activeFolder.bizName}
-                   filesCount={readyCount}
-                   mode={mode}
-                   onReanalyze={handleAnalyzeAll}
-                   onDiscuss={() => { window.location.href = "/advisor"; }}
-                 />
-               )}
+              {/* Analysis result */}
+              {analysis && (
+                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, overflow:"hidden", boxShadow:shadow.sm }}>
+                  <div style={{ background:C.text, padding:"16px 22px", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                    <div>
+                      <div style={{ fontSize:11, color:"rgba(245,245,247,0.5)", textTransform:"uppercase" as const, letterSpacing:"0.8px", marginBottom:4 }}>
+                        {MODES.find(m=>m.id===mode)?.icon} {MODES.find(m=>m.id===mode)?.label} · {readyFiles.length} file{readyFiles.length!==1?"s":""}
+                      </div>
+                      <div style={{ fontSize:16, fontWeight:600, color:"#f5f5f7" }}>{activeFolder?.bizName}</div>
+                    </div>
+                    <button onClick={()=>{setAnalysis(null);setDashData(null);setDashReady(false);}} style={{ background:"rgba(255,255,255,0.1)", border:"none", color:"rgba(255,255,255,0.6)", width:28, height:28, borderRadius:"50%", cursor:"pointer", fontSize:14, display:"flex", alignItems:"center", justifyContent:"center" }}>
+                      ×
+                    </button>
+                  </div>
+                  <div style={{ padding:"22px" }}>
+                    {renderAnalysis(analysis)}
+                  </div>
+                  <div style={{ padding:"16px 22px", borderTop:`1px solid ${C.border}`, display:"flex", gap:12 }}>
+                    <Link href="/advisor" style={{ ...btnPrimary, flex:1, padding:"11px", borderRadius:radius.sm, textAlign:"center" as const }}>
+                      💬 Discuss with Advisor
+                    </Link>
+                    <button onClick={handleAnalyzeAll} style={{ padding:"11px 20px", borderRadius:radius.sm, background:C.bg, border:`1px solid ${C.border}`, color:C.text2, fontSize:13, fontWeight:500, cursor:"pointer" }}>
+                      Re-analyze
+                    </button>
+                  </div>
+                </div>
+              )}
 
-
-              {folderFiles.length === 0 && !uploading && (
-                <div className="text-center py-8 text-gray-400 text-sm">Drop files above to get started</div>
+              {/* Empty state */}
+              {files.length === 0 && !uploading && (
+                <div style={{ textAlign:"center", padding:"40px 20px", color:C.text3 }}>
+                  <div style={{ fontSize:40, marginBottom:12 }}>📄</div>
+                  <div style={{ fontSize:14, fontWeight:500, color:C.text, marginBottom:6 }}>No files yet</div>
+                  <div style={{ fontSize:13 }}>Click the upload zone above to add your first file.</div>
+                </div>
               )}
             </div>
           )}
-        </main>
+        </div>
       </div>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
   );
 }
