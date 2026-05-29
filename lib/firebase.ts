@@ -1,7 +1,6 @@
 // lib/firebase.ts
-
-import { initializeApp, getApps, getApp } from "firebase/app";
-import { getAuth } from "firebase/auth";
+import { initializeApp, getApps } from "firebase/app";
+import { getAuth, connectAuthEmulator } from "firebase/auth";
 import { getFirestore, enableNetwork } from "firebase/firestore";
 
 const firebaseConfig = {
@@ -13,12 +12,11 @@ const firebaseConfig = {
   appId:             process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-const app = getApps().length ? getApp() : initializeApp(firebaseConfig);
-
+const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
 export const auth = getAuth(app);
-export const db = getFirestore(app);
+export const db   = getFirestore(app);
 
-// Fixes "client is offline" error after login
+// Keep Firestore online
 if (typeof window !== "undefined") {
   enableNetwork(db).catch(() => {});
 }
