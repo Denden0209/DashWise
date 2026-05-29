@@ -2,36 +2,39 @@
 import { useState, useEffect, useRef } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { deleteDoc, doc } from "firebase/firestore";
+import { db } from "@/lib/firebase";
 import { useAuth } from "@/lib/AuthContext";
 import {
   getUserFolders, createFolder, getFolderFiles,
-  addFileToFolder, updateFileRecord,
-  saveFolderAnalysis,
+  addFileToFolder, updateFileRecord, saveFolderAnalysis,
   BusinessFolder, FolderFile,
 } from "@/lib/db";
 import Nav from "@/components/Nav";
 import { C, radius, shadow, btnPrimary } from "@/lib/styles";
 
 const MODES = [
-  { id:"explain", icon:"💡", label:"Full Report",   desc:"Overall analysis of all files" },
-  { id:"meeting", icon:"🗓️", label:"Meeting Prep",  desc:"Key talking points with numbers" },
-  { id:"anomaly", icon:"🔍", label:"Find Issues",   desc:"Flag problems and anomalies" },
-  { id:"action",  icon:"⚡", label:"Action Plan",   desc:"Specific steps to take now" },
+  { id:"explain", icon:"💡", label:"Full Report",  desc:"Overall analysis" },
+  { id:"meeting", icon:"🗓️", label:"Meeting Prep", desc:"Key talking points" },
+  { id:"anomaly", icon:"🔍", label:"Find Issues",  desc:"Flag problems" },
+  { id:"action",  icon:"⚡", label:"Action Plan",  desc:"Steps to take now" },
 ];
 
-function Spinner({ size=20, color=C.blue }: { size?: number; color?: string }) {
-  return (
-    <div style={{ width:size, height:size, border:`2px solid ${color}30`, borderTopColor:color, borderRadius:"50%", animation:"spin .7s linear infinite", flexShrink:0 }}/>
-  );
+const EXT_ICON: Record<string,string> = {
+  csv:"📊", xlsx:"📗", xls:"📗", xlsm:"📗", pdf:"📄", txt:"📝", json:"🔧",
+};
+
+function Spinner({ size=18, color=C.blue }: { size?:number; color?:string }) {
+  return <div style={{ width:size, height:size, border:`2px solid ${color}30`, borderTopColor:color, borderRadius:"50%", animation:"spin .7s linear infinite", flexShrink:0 }}/>;
 }
 
 export default function FilesPage() {
-  const router    = useRouter();
+  const router = useRouter();
   const { user, profile, loading } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   const [folders,        setFolders]        = useState<BusinessFolder[]>([]);
-  const [activeFolderId, setActiveFolderId] = useState<string | null>(null);
+  const [activeFolderId, setActiveFolderId] = useState<string|null>(null);
   const [files,          setFiles]          = useState<FolderFile[]>([]);
   const [newFolderName,  setNewFolderName]  = useState("");
   const [creatingFolder, setCreatingFolder] = useState(false);
@@ -39,10 +42,11 @@ export default function FilesPage() {
   const [uploading,      setUploading]      = useState(false);
   const [mode,           setMode]           = useState("explain");
   const [analyzing,      setAnalyzing]      = useState(false);
-  const [analysis,       setAnalysis]       = useState<string | null>(null);
-  const [dashData,       setDashData]       = useState<unknown>(null);
+  const [analysis,       setAnalysis]       = useState<string|null>(null);
   const [dashReady,      setDashReady]      = useState(false);
   const [errorMsg,       setErrorMsg]       = useState("");
+  const [deletingId,     setDeletingId]     = useState<string|null>(null);
+  const [showSidebar,    setShowSidebar]    = useState(false);
 
   useEffect(() => {
     if (!loading && !user) router.push("/login");
@@ -58,7 +62,7 @@ export default function FilesPage() {
 
   useEffect(() => {
     if (!user || !activeFolderId) return;
-    setFiles([]); setAnalysis(null); setDashData(null); setDashReady(false);
+    setFiles([]); setAnalysis(null); setDashReady(false);
     getFolderFiles(user.uid, activeFolderId).then(setFiles);
   }, [user, activeFolderId]);
 
@@ -69,25 +73,26 @@ export default function FilesPage() {
     const updated = await getUserFolders(user.uid);
     setFolders(updated);
     setActiveFolderId(id);
-    setNewFolderName("");
-    setShowNewFolder(false);
+    setNewFolderName(""); setShowNewFolder(false); setShowSidebar(false);
     setCreatingFolder(false);
   }
 
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
-    const selectedFiles = e.target.files;
-    if (!selectedFiles || !user || !activeFolderId) return;
+    const selected = e.target.files;
+    if (!selected || !user || !activeFolderId) return;
     setUploading(true); setErrorMsg("");
-    for (const file of Array.from(selectedFiles)) {
-      const fileId = await addFileToFolder(user.uid, activeFolderId, {
-        name: file.name, size: file.size,
-        type: file.name.split(".").pop()?.toLowerCase() || "unknown",
-        status: "uploading",
-      });
+    for (const file of Array.from(selected)) {
+      let fileId = "";
       try {
+        fileId = await addFileToFolder(user.uid, activeFolderId, {
+          name: file.name, size: file.size,
+          type: file.name.split(".").pop()?.toLowerCase() || "unknown",
+          status:"uploading",
+        });
         const form = new FormData();
         form.append("file", file);
         const res  = await fetch("/api/parse-files", { method:"POST", body:form });
+        if (!res.ok) throw new Error("Parse failed");
         const data = await res.json();
         await updateFileRecord(user.uid, activeFolderId, fileId, {
           parsedContent: data.content || "",
@@ -96,52 +101,64 @@ export default function FilesPage() {
           status:        "ready",
         });
       } catch {
-        await updateFileRecord(user.uid, activeFolderId, fileId, { status:"error" });
+        if (fileId) await updateFileRecord(user.uid, activeFolderId, fileId, { status:"error" });
+        setErrorMsg(`Failed to parse ${file.name}. Check the file format and try again.`);
       }
     }
     const updated = await getFolderFiles(user.uid, activeFolderId);
-    setFiles(updated);
-    setUploading(false);
+    setFiles(updated); setUploading(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
+  }
+
+  async function handleDeleteFile(fileId: string, fileName: string) {
+    if (!user || !activeFolderId) return;
+    if (!confirm(`Delete "${fileName}"? This cannot be undone.`)) return;
+    setDeletingId(fileId);
+    try {
+      await deleteDoc(doc(db, "users", user.uid, "folders", activeFolderId, "files", fileId));
+      setFiles(prev => prev.filter(f => f.id !== fileId));
+    } catch {
+      setErrorMsg("Failed to delete file. Please try again.");
+    } finally { setDeletingId(null); }
   }
 
   async function handleAnalyzeAll() {
     if (!user || !activeFolderId) return;
     const ready = files.filter(f => f.status === "ready");
-    if (ready.length === 0) return;
-    setAnalyzing(true); setAnalysis(null); setDashData(null); setDashReady(false); setErrorMsg("");
-
-    const filePayloads = ready.map(f => ({
-      fileName: f.name, fileType: f.type,
-      content:  (f.parsedContent || "").slice(0, 8000),
-      sheets:   f.sheets || [],
-    }));
+    if (ready.length === 0) { setErrorMsg("No ready files to analyze. Wait for uploads to finish parsing."); return; }
+    setAnalyzing(true); setAnalysis(null); setDashReady(false); setErrorMsg("");
 
     try {
       const res = await fetch("/api/analyze-folder", {
         method:"POST",
         headers:{ "Content-Type":"application/json" },
         body: JSON.stringify({
-          files:        filePayloads,
+          files: ready.map(f => ({
+            fileName: f.name, fileType: f.type,
+            content:  (f.parsedContent || "").slice(0, 8000),
+            sheets:   f.sheets || [],
+          })),
           businessType: profile?.bizType || "retail",
           bizName:      activeFolder?.bizName || profile?.bizName || "My Business",
-          mode,
-          goals:        profile?.goals || [],
+          mode, goals: profile?.goals || [],
         }),
       });
-      if (!res.ok) throw new Error("Server error");
+      if (!res.ok) {
+        const errData = await res.json().catch(()=>({}));
+        throw new Error(errData.error || `Server error (${res.status})`);
+      }
       const data = await res.json();
+      if (!data.success) throw new Error(data.error || "Analysis failed");
       setAnalysis(data.analysis || "");
-      setDashData(data.dashboardData || null);
-      setDashReady(true);
+      setDashReady(!!data.dashboardData);
       if (data.dashboardData?.summary) {
-        await saveFolderAnalysis(user.uid, activeFolderId, data.dashboardData.summary.slice(0, 300));
+        await saveFolderAnalysis(user.uid, activeFolderId, data.dashboardData.summary.slice(0,300));
       }
       try {
         sessionStorage.setItem("dashwise-analysis", JSON.stringify({
           dashboardData: data.dashboardData,
           narrative:     data.analysis,
-          bizName:       activeFolder?.bizName || profile?.bizName || "My Business",
+          bizName:       activeFolder?.bizName || profile?.bizName,
           mode,
         }));
       } catch {}
@@ -150,9 +167,8 @@ export default function FilesPage() {
     } finally { setAnalyzing(false); }
   }
 
-  const activeFolder  = folders.find(f => f.id === activeFolderId);
-  const readyFiles    = files.filter(f => f.status === "ready");
-  const uploadingFiles = files.filter(f => f.status === "uploading");
+  const activeFolder = folders.find(f => f.id === activeFolderId);
+  const readyFiles   = files.filter(f => f.status === "ready");
 
   function renderAnalysis(text: string) {
     return text.split("\n").map((line, i) => {
@@ -160,7 +176,7 @@ export default function FilesPage() {
       if (line.startsWith("**") && line.endsWith("**"))
         return <div key={i} style={{ fontWeight:700, color:C.text, fontSize:14, marginTop:16, marginBottom:6, paddingBottom:6, borderBottom:`1px solid ${C.border}` }}>{line.replace(/\*\*/g,"")}</div>;
       if (line.match(/\*\*(.*?)\*\*/))
-        return <div key={i} style={{ fontSize:13, color:C.text2, lineHeight:1.6, marginBottom:4 }} dangerouslySetInnerHTML={{ __html: line.replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>") }}/>;
+        return <div key={i} style={{ fontSize:13, color:C.text2, lineHeight:1.6, marginBottom:4 }} dangerouslySetInnerHTML={{ __html:line.replace(/\*\*(.*?)\*\*/g,"<strong>$1</strong>") }}/>;
       return <div key={i} style={{ fontSize:13, color:C.text2, lineHeight:1.6, marginBottom:4 }}>{line}</div>;
     });
   }
@@ -172,179 +188,179 @@ export default function FilesPage() {
   );
 
   return (
-    <div style={{ minHeight:"100vh", background:C.bg }}>
+    <div style={{ minHeight:"100vh", background:C.bg, display:"flex", flexDirection:"column" }}>
       <Nav/>
-      <div style={{ display:"flex", height:"calc(100vh - 52px)" }}>
 
-        {/* ── Sidebar ── */}
-        <div style={{ width:260, flexShrink:0, borderRight:`1px solid ${C.border}`, background:C.surface, display:"flex", flexDirection:"column", overflow:"hidden" }}>
-          <div style={{ padding:"16px 16px 12px", borderBottom:`1px solid ${C.border}` }}>
-            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:12 }}>
-              <span style={{ fontSize:11, fontWeight:600, textTransform:"uppercase" as const, letterSpacing:"0.8px", color:C.text3 }}>Folders</span>
-              <button onClick={()=>setShowNewFolder(!showNewFolder)} style={{ background:C.blueBg, border:`1px solid ${C.blueMid}`, color:C.blue, fontSize:11, fontWeight:600, padding:"4px 10px", borderRadius:6, cursor:"pointer" }}>
-                + New
-              </button>
+      {/* Mobile folder selector bar */}
+      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 16px", background:C.surface, borderBottom:`1px solid ${C.border}`, overflowX:"auto" }}>
+        <button onClick={()=>setShowSidebar(true)} style={{ background:C.bg, border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"7px 12px", fontSize:13, color:C.text2, cursor:"pointer", whiteSpace:"nowrap", flexShrink:0 }}>
+          📁 Folders
+        </button>
+        {folders.map(f => (
+          <button key={f.id} onClick={()=>setActiveFolderId(f.id!)} style={{
+            background: activeFolderId===f.id?C.blue:C.surface,
+            color:      activeFolderId===f.id?"#fff":C.text2,
+            border:`1px solid ${activeFolderId===f.id?C.blue:C.border}`,
+            borderRadius:radius.full, padding:"7px 14px", fontSize:13,
+            fontWeight: activeFolderId===f.id?600:400,
+            cursor:"pointer", whiteSpace:"nowrap", flexShrink:0,
+          }}>
+            {f.bizName}
+          </button>
+        ))}
+        <button onClick={()=>setShowNewFolder(true)} style={{ background:"transparent", border:`1px dashed ${C.border2}`, borderRadius:radius.full, padding:"7px 14px", fontSize:13, color:C.text3, cursor:"pointer", whiteSpace:"nowrap", flexShrink:0 }}>
+          + New
+        </button>
+      </div>
+
+      {/* Mobile new folder input */}
+      {showNewFolder && (
+        <div style={{ background:C.surface, borderBottom:`1px solid ${C.border}`, padding:"12px 16px", display:"flex", gap:8 }}>
+          <input autoFocus value={newFolderName} onChange={e=>setNewFolderName(e.target.value)} onKeyDown={e=>{ if(e.key==="Enter")handleCreateFolder(); if(e.key==="Escape")setShowNewFolder(false); }} placeholder="Folder name..." style={{ flex:1, background:C.bg, border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"9px 12px", fontSize:14, color:C.text, outline:"none" }}/>
+          <button onClick={handleCreateFolder} disabled={!newFolderName.trim()||creatingFolder} style={{ ...btnPrimary, padding:"9px 16px", borderRadius:radius.sm, fontSize:13, opacity:(!newFolderName.trim()||creatingFolder)?.5:1 }}>
+            {creatingFolder?"...":"Add"}
+          </button>
+          <button onClick={()=>setShowNewFolder(false)} style={{ background:"transparent", border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"9px 12px", fontSize:13, color:C.text3, cursor:"pointer" }}>×</button>
+        </div>
+      )}
+
+      {/* Mobile sidebar overlay */}
+      {showSidebar && (
+        <div style={{ position:"fixed", inset:0, zIndex:200, display:"flex" }}>
+          <div onClick={()=>setShowSidebar(false)} style={{ flex:1, background:"rgba(0,0,0,0.4)" }}/>
+          <div style={{ width:280, background:C.surface, display:"flex", flexDirection:"column", overflowY:"auto", padding:16 }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
+              <span style={{ fontWeight:600, fontSize:15, color:C.text }}>Folders</span>
+              <button onClick={()=>setShowSidebar(false)} style={{ background:"none", border:"none", fontSize:20, color:C.text3, cursor:"pointer" }}>×</button>
             </div>
-            {showNewFolder && (
-              <div style={{ display:"flex", gap:6 }}>
-                <input
-                  autoFocus
-                  value={newFolderName}
-                  onChange={e=>setNewFolderName(e.target.value)}
-                  onKeyDown={e=>{ if(e.key==="Enter") handleCreateFolder(); if(e.key==="Escape") setShowNewFolder(false); }}
-                  placeholder="Folder name..."
-                  style={{ flex:1, background:C.bg, border:`1px solid ${C.border}`, borderRadius:6, padding:"7px 10px", fontSize:13, color:C.text, outline:"none" }}
-                />
-                <button onClick={handleCreateFolder} disabled={!newFolderName.trim()||creatingFolder} style={{ ...btnPrimary, padding:"7px 12px", borderRadius:6, fontSize:12 }}>
-                  {creatingFolder ? "..." : "Add"}
-                </button>
-              </div>
-            )}
-          </div>
-
-          <div style={{ flex:1, overflowY:"auto", padding:8 }}>
-            {folders.length === 0 ? (
-              <div style={{ padding:"20px 12px", textAlign:"center", color:C.text3, fontSize:13 }}>
-                No folders yet. Create one to start uploading.
-              </div>
-            ) : (
-              folders.map(folder => {
-                const active = activeFolderId === folder.id;
-                return (
-                  <button key={folder.id} onClick={()=>setActiveFolderId(folder.id!)} style={{
-                    width:"100%", display:"flex", alignItems:"center", gap:10,
-                    padding:"10px 12px", borderRadius:radius.sm, marginBottom:2,
-                    background: active ? C.blueBg : "transparent",
-                    border:     active ? `1px solid ${C.blueMid}` : "1px solid transparent",
-                    cursor:"pointer", textAlign:"left" as const,
-                  }}>
-                    <span style={{ fontSize:16, flexShrink:0 }}>📁</span>
-                    <div style={{ flex:1, minWidth:0 }}>
-                      <div style={{ fontSize:13, fontWeight: active?600:400, color: active?C.blue:C.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
-                        {folder.bizName}
-                      </div>
-                      <div style={{ fontSize:11, color:C.text3 }}>{folder.fileCount} file{folder.fileCount!==1?"s":""}</div>
-                    </div>
-                  </button>
-                );
-              })
-            )}
+            {folders.map(f=>(
+              <button key={f.id} onClick={()=>{ setActiveFolderId(f.id!); setShowSidebar(false); }} style={{ display:"flex", alignItems:"center", gap:10, padding:"12px", borderRadius:radius.sm, marginBottom:4, background:activeFolderId===f.id?C.blueBg:"transparent", border:`1px solid ${activeFolderId===f.id?C.blueMid:"transparent"}`, cursor:"pointer", textAlign:"left" as const }}>
+                <span>📁</span>
+                <span style={{ fontSize:14, fontWeight:activeFolderId===f.id?600:400, color:activeFolderId===f.id?C.blue:C.text }}>{f.bizName}</span>
+              </button>
+            ))}
+            <button onClick={()=>{ setShowSidebar(false); setShowNewFolder(true); }} style={{ marginTop:8, padding:"11px", borderRadius:radius.sm, background:C.bg, border:`1px dashed ${C.border2}`, fontSize:13, color:C.text3, cursor:"pointer" }}>
+              + New folder
+            </button>
           </div>
         </div>
+      )}
 
-        {/* ── Main panel ── */}
-        <div style={{ flex:1, overflowY:"auto", padding:"28px 32px" }}>
+      {/* Main content */}
+      <div style={{ flex:1, overflowY:"auto", padding:"20px 16px" }}>
+        <div style={{ maxWidth:760, margin:"0 auto" }}>
+
           {!activeFolderId ? (
-            <div style={{ display:"flex", flexDirection:"column", alignItems:"center", justifyContent:"center", height:"100%", textAlign:"center" }}>
-              <div style={{ fontSize:52, marginBottom:16 }}>📂</div>
+            <div style={{ textAlign:"center", padding:"60px 20px" }}>
+              <div style={{ fontSize:48, marginBottom:16 }}>📂</div>
               <h2 style={{ fontSize:20, fontWeight:700, color:C.text, marginBottom:8 }}>No folder selected</h2>
-              <p style={{ fontSize:14, color:C.text3 }}>Create a folder in the sidebar to get started.</p>
+              <p style={{ fontSize:14, color:C.text3 }}>Create a folder above to get started.</p>
             </div>
           ) : (
-            <div style={{ maxWidth:800 }}>
-
-              {/* Folder header */}
-              <div style={{ marginBottom:24 }}>
-                <h1 style={{ fontSize:26, fontWeight:700, letterSpacing:"-0.5px", color:C.text, marginBottom:4 }}>{activeFolder?.bizName}</h1>
-                <p style={{ fontSize:13, color:C.text3 }}>{files.length} file{files.length!==1?"s":""} · {readyFiles.length} ready to analyze</p>
+            <>
+              {/* Folder title */}
+              <div style={{ marginBottom:20 }}>
+                <h1 style={{ fontSize:22, fontWeight:700, letterSpacing:"-0.4px", color:C.text, marginBottom:3 }}>{activeFolder?.bizName}</h1>
+                <p style={{ fontSize:13, color:C.text3 }}>{files.length} file{files.length!==1?"s":""} · {readyFiles.length} ready</p>
               </div>
 
               {/* Error */}
               {errorMsg && (
-                <div style={{ background:C.redBg, border:`1px solid #ffd6d6`, color:C.red, fontSize:13, padding:"12px 16px", borderRadius:radius.sm, marginBottom:20, display:"flex", justifyContent:"space-between", alignItems:"center" }}>
-                  {errorMsg}
-                  <button onClick={()=>setErrorMsg("")} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:16 }}>×</button>
+                <div style={{ background:C.redBg, border:`1px solid #ffd6d6`, color:C.red, fontSize:13, padding:"12px 14px", borderRadius:radius.sm, marginBottom:16, display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+                  <span style={{ lineHeight:1.5 }}>⚠ {errorMsg}</span>
+                  <button onClick={()=>setErrorMsg("")} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:18, flexShrink:0, lineHeight:1 }}>×</button>
                 </div>
               )}
 
               {/* Upload zone */}
               <div
-                onClick={()=>fileInputRef.current?.click()}
-                style={{ background:C.surface, border:`2px dashed ${C.border2}`, borderRadius:radius.lg, padding:"32px 24px", textAlign:"center", cursor:"pointer", marginBottom:20, transition:"border-color 0.2s" }}
-                onMouseEnter={e=>(e.currentTarget as HTMLElement).style.borderColor=C.blue}
-                onMouseLeave={e=>(e.currentTarget as HTMLElement).style.borderColor=C.border2}
+                onClick={()=>!uploading&&fileInputRef.current?.click()}
+                style={{ background:C.surface, border:`2px dashed ${C.border2}`, borderRadius:radius.lg, padding:"28px 20px", textAlign:"center", cursor:uploading?"default":"pointer", marginBottom:16, transition:"border-color 0.2s", boxShadow:shadow.sm }}
+                onMouseEnter={e=>{ if(!uploading)(e.currentTarget as HTMLElement).style.borderColor=C.blue; }}
+                onMouseLeave={e=>{ (e.currentTarget as HTMLElement).style.borderColor=C.border2; }}
               >
                 <input ref={fileInputRef} type="file" multiple accept=".csv,.xlsx,.xls,.xlsm,.pdf,.txt,.json" onChange={handleUpload} style={{ display:"none" }}/>
                 {uploading ? (
                   <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12 }}>
-                    <Spinner/>
-                    <span style={{ fontSize:14, color:C.text2 }}>Uploading and parsing files...</span>
+                    <Spinner/><span style={{ fontSize:14, color:C.text2 }}>Uploading and parsing...</span>
                   </div>
                 ) : (
                   <>
-                    <div style={{ fontSize:32, marginBottom:10 }}>⬆️</div>
-                    <div style={{ fontWeight:600, fontSize:15, color:C.text, marginBottom:4 }}>Drop files here or click to browse</div>
-                    <div style={{ fontSize:13, color:C.text3 }}>CSV, Excel, PDF, TXT, JSON supported</div>
+                    <div style={{ fontSize:28, marginBottom:8 }}>⬆️</div>
+                    <div style={{ fontWeight:600, fontSize:14, color:C.text, marginBottom:3 }}>Tap to upload files</div>
+                    <div style={{ fontSize:12, color:C.text3 }}>CSV · Excel · PDF · TXT · JSON</div>
                   </>
                 )}
               </div>
 
               {/* File list */}
               {files.length > 0 && (
-                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, overflow:"hidden", boxShadow:shadow.sm, marginBottom:20 }}>
+                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, overflow:"hidden", boxShadow:shadow.sm, marginBottom:16 }}>
                   {files.map((file, i) => (
-                    <div key={file.id||i} style={{ display:"flex", alignItems:"center", gap:12, padding:"12px 18px", borderBottom:i<files.length-1?`1px solid #f9f9fb`:"none" }}>
-                      <span style={{ fontSize:20, flexShrink:0 }}>
-                        {{"csv":"📊","xlsx":"📗","xls":"📗","pdf":"📄","txt":"📝","json":"🔧"}[file.type]||"📎"}
-                      </span>
+                    <div key={file.id||i} style={{ display:"flex", alignItems:"center", gap:10, padding:"13px 16px", borderBottom:i<files.length-1?`1px solid #f9f9fb`:"none" }}>
+                      <span style={{ fontSize:20, flexShrink:0 }}>{EXT_ICON[file.type]||"📎"}</span>
                       <div style={{ flex:1, minWidth:0 }}>
                         <div style={{ fontSize:13, fontWeight:500, color:C.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{file.name}</div>
                         <div style={{ fontSize:11, color:C.text3, marginTop:2 }}>
                           {(file.size/1024).toFixed(1)} KB
                           {file.sheets?.length ? ` · ${file.sheets.length} sheets` : ""}
-                          {file.rowCount ? ` · ${file.rowCount} rows` : ""}
+                          {(file.rowCount||0)>0 ? ` · ${file.rowCount} rows` : ""}
                         </div>
                       </div>
-                      {file.status === "uploading" ? (
-                        <div style={{ display:"flex", alignItems:"center", gap:6 }}>
-                          <Spinner size={14}/>
-                          <span style={{ fontSize:11, color:C.text3 }}>Parsing...</span>
+
+                      {/* Status badge */}
+                      {file.status==="uploading" ? (
+                        <div style={{ display:"flex", alignItems:"center", gap:5, flexShrink:0 }}>
+                          <Spinner size={14}/><span style={{ fontSize:11, color:C.text3 }}>Parsing...</span>
                         </div>
                       ) : (
-                        <span style={{ fontSize:11, fontWeight:600, padding:"3px 10px", borderRadius:20, background:file.status==="ready"?"#f0faf4":C.redBg, color:file.status==="ready"?"#34c759":C.red, border:`1px solid ${file.status==="ready"?"#c8f0d8":"#ffd6d6"}` }}>
-                          {file.status==="ready" ? "✓ Ready" : "Error"}
+                        <span style={{ fontSize:11, fontWeight:600, padding:"3px 9px", borderRadius:20, flexShrink:0, background:file.status==="ready"?"#f0faf4":C.redBg, color:file.status==="ready"?"#34c759":C.red, border:`1px solid ${file.status==="ready"?"#c8f0d8":"#ffd6d6"}` }}>
+                          {file.status==="ready"?"✓ Ready":"Error"}
                         </span>
+                      )}
+
+                      {/* Delete button */}
+                      {file.id && file.status !== "uploading" && (
+                        <button
+                          onClick={()=>handleDeleteFile(file.id!, file.name)}
+                          disabled={deletingId===file.id}
+                          title="Delete file"
+                          style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.text3, width:30, height:30, borderRadius:radius.sm, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, flexShrink:0, opacity:deletingId===file.id?.5:1 }}>
+                          {deletingId===file.id ? <Spinner size={12}/> : "🗑"}
+                        </button>
                       )}
                     </div>
                   ))}
                 </div>
               )}
 
-              {/* Analysis controls */}
+              {/* Analysis modes */}
               {readyFiles.length > 0 && (
-                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, padding:20, boxShadow:shadow.sm, marginBottom:20 }}>
+                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, padding:18, boxShadow:shadow.sm, marginBottom:16 }}>
                   <div style={{ fontSize:11, fontWeight:600, textTransform:"uppercase" as const, letterSpacing:"0.8px", color:C.text3, marginBottom:12 }}>
                     Analysis Mode
                   </div>
-                  <div style={{ display:"grid", gridTemplateColumns:"repeat(2,1fr)", gap:8, marginBottom:16 }}>
-                    {MODES.map(m => (
-                      <button key={m.id} onClick={()=>setMode(m.id)} style={{
-                        display:"flex", alignItems:"center", gap:10,
-                        padding:"12px 14px", borderRadius:radius.sm, cursor:"pointer",
-                        background: mode===m.id?C.blueBg:C.bg,
-                        border:     mode===m.id?`1.5px solid ${C.blue}`:`1px solid ${C.border}`,
-                        textAlign:"left" as const,
-                      }}>
-                        <span style={{ fontSize:20, flexShrink:0 }}>{m.icon}</span>
+                  <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:14 }}>
+                    {MODES.map(m=>(
+                      <button key={m.id} onClick={()=>setMode(m.id)} style={{ display:"flex", alignItems:"center", gap:10, padding:"11px 12px", borderRadius:radius.sm, cursor:"pointer", background:mode===m.id?C.blueBg:C.bg, border:mode===m.id?`1.5px solid ${C.blue}`:`1px solid ${C.border}`, textAlign:"left" as const }}>
+                        <span style={{ fontSize:18, flexShrink:0 }}>{m.icon}</span>
                         <div>
-                          <div style={{ fontSize:13, fontWeight:600, color:mode===m.id?C.blue:C.text }}>{m.label}</div>
+                          <div style={{ fontSize:12, fontWeight:600, color:mode===m.id?C.blue:C.text }}>{m.label}</div>
                           <div style={{ fontSize:11, color:C.text3 }}>{m.desc}</div>
                         </div>
                       </button>
                     ))}
                   </div>
-
-                  <button onClick={handleAnalyzeAll} disabled={analyzing} style={{ ...btnPrimary, width:"100%", padding:"13px", borderRadius:radius.sm, fontSize:15, opacity:analyzing?.6:1 }}>
+                  <button onClick={handleAnalyzeAll} disabled={analyzing} style={{ ...btnPrimary, width:"100%", padding:"14px", borderRadius:radius.sm, fontSize:15, opacity:analyzing?.6:1 }}>
                     {analyzing ? (
                       <><Spinner size={16} color="#fff"/> Analyzing {readyFiles.length} file{readyFiles.length!==1?"s":""}...</>
                     ) : (
-                      `🧠 Analyze ${readyFiles.length} file${readyFiles.length!==1?"s":""} together →`
+                      `🧠 Analyze ${readyFiles.length} file${readyFiles.length!==1?"s":""} →`
                     )}
                   </button>
-
                   {dashReady && (
                     <button onClick={()=>router.push("/dashboard-view")} style={{ ...btnPrimary, width:"100%", marginTop:10, padding:"13px", borderRadius:radius.sm, fontSize:14, background:"transparent", color:C.blue, border:`2px solid ${C.blue}` }}>
-                      🚀 Open Full Dashboard View
+                      🚀 Open Full Dashboard
                     </button>
                   )}
                 </div>
@@ -353,40 +369,36 @@ export default function FilesPage() {
               {/* Analysis result */}
               {analysis && (
                 <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, overflow:"hidden", boxShadow:shadow.sm }}>
-                  <div style={{ background:C.text, padding:"16px 22px", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
+                  <div style={{ background:C.text, padding:"14px 18px", display:"flex", alignItems:"center", justifyContent:"space-between" }}>
                     <div>
-                      <div style={{ fontSize:11, color:"rgba(245,245,247,0.5)", textTransform:"uppercase" as const, letterSpacing:"0.8px", marginBottom:4 }}>
-                        {MODES.find(m=>m.id===mode)?.icon} {MODES.find(m=>m.id===mode)?.label} · {readyFiles.length} file{readyFiles.length!==1?"s":""}
+                      <div style={{ fontSize:11, color:"rgba(245,245,247,0.5)", marginBottom:3 }}>
+                        {MODES.find(m=>m.id===mode)?.icon} {MODES.find(m=>m.id===mode)?.label} · {readyFiles.length} files
                       </div>
-                      <div style={{ fontSize:16, fontWeight:600, color:"#f5f5f7" }}>{activeFolder?.bizName}</div>
+                      <div style={{ fontSize:15, fontWeight:600, color:"#f5f5f7" }}>{activeFolder?.bizName}</div>
                     </div>
-                    <button onClick={()=>{setAnalysis(null);setDashData(null);setDashReady(false);}} style={{ background:"rgba(255,255,255,0.1)", border:"none", color:"rgba(255,255,255,0.6)", width:28, height:28, borderRadius:"50%", cursor:"pointer", fontSize:14, display:"flex", alignItems:"center", justifyContent:"center" }}>
-                      ×
-                    </button>
+                    <button onClick={()=>{setAnalysis(null);setDashReady(false);}} style={{ background:"rgba(255,255,255,0.1)", border:"none", color:"rgba(255,255,255,0.7)", width:28, height:28, borderRadius:"50%", cursor:"pointer", fontSize:16, display:"flex", alignItems:"center", justifyContent:"center" }}>×</button>
                   </div>
-                  <div style={{ padding:"22px" }}>
-                    {renderAnalysis(analysis)}
-                  </div>
-                  <div style={{ padding:"16px 22px", borderTop:`1px solid ${C.border}`, display:"flex", gap:12 }}>
-                    <Link href="/advisor" style={{ ...btnPrimary, flex:1, padding:"11px", borderRadius:radius.sm, textAlign:"center" as const }}>
-                      💬 Discuss with Advisor
+                  <div style={{ padding:"20px 18px" }}>{renderAnalysis(analysis)}</div>
+                  <div style={{ padding:"14px 18px", borderTop:`1px solid ${C.border}`, display:"flex", gap:10, flexWrap:"wrap" as const }}>
+                    <Link href="/advisor" style={{ ...btnPrimary, flex:1, minWidth:120, padding:"11px", borderRadius:radius.sm, textAlign:"center" as const, fontSize:13 }}>
+                      💬 Ask Advisor
                     </Link>
-                    <button onClick={handleAnalyzeAll} style={{ padding:"11px 20px", borderRadius:radius.sm, background:C.bg, border:`1px solid ${C.border}`, color:C.text2, fontSize:13, fontWeight:500, cursor:"pointer" }}>
-                      Re-analyze
+                    <button onClick={handleAnalyzeAll} style={{ padding:"11px 16px", borderRadius:radius.sm, background:C.bg, border:`1px solid ${C.border}`, color:C.text2, fontSize:13, cursor:"pointer", flexShrink:0 }}>
+                      ↻ Re-analyze
                     </button>
                   </div>
                 </div>
               )}
 
               {/* Empty state */}
-              {files.length === 0 && !uploading && (
+              {files.length===0 && !uploading && (
                 <div style={{ textAlign:"center", padding:"40px 20px", color:C.text3 }}>
-                  <div style={{ fontSize:40, marginBottom:12 }}>📄</div>
-                  <div style={{ fontSize:14, fontWeight:500, color:C.text, marginBottom:6 }}>No files yet</div>
-                  <div style={{ fontSize:13 }}>Click the upload zone above to add your first file.</div>
+                  <div style={{ fontSize:36, marginBottom:10 }}>📄</div>
+                  <div style={{ fontSize:14, fontWeight:500, color:C.text, marginBottom:5 }}>No files yet</div>
+                  <div style={{ fontSize:13 }}>Upload files using the zone above.</div>
                 </div>
               )}
-            </div>
+            </>
           )}
         </div>
       </div>

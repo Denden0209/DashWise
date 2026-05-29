@@ -25,3 +25,36 @@ input, textarea, select { font-family: inherit; box-sizing: border-box; }
 @keyframes spin    { to { transform: rotate(360deg); } }
 @keyframes fadeUp  { from { opacity:0; transform:translateY(10px); } to { opacity:1; transform:translateY(0); } }
 @keyframes pulse   { 0%,100%{opacity:1} 50%{opacity:.4} }
+
+/* ── Mobile app feel ─────────────────────────────────────── */
+@media (max-width: 639px) {
+  body {
+    /* Prevent pull-to-refresh bounce on iOS */
+    overscroll-behavior: none;
+  }
+
+  /* Larger tap targets */
+  button, a {
+    min-height: 44px;
+    min-width: 44px;
+  }
+
+  /* Prevent text size adjustments on orientation change */
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+
+  /* Cards go full width on mobile */
+  .desktop-grid-4 { grid-template-columns: 1fr 1fr !important; }
+  .desktop-grid-3 { grid-template-columns: 1fr 1fr !important; }
+  .desktop-grid-2 { grid-template-columns: 1fr !important; }
+
+  /* Reduce padding on mobile */
+  main { padding-left: 16px !important; padding-right: 16px !important; }
+}
+
+/* ── Safe area support (iPhone notch / home bar) ─────────── */
+@supports (padding: env(safe-area-inset-top)) {
+  .safe-top    { padding-top:    env(safe-area-inset-top);    }
+  .safe-bottom { padding-bottom: env(safe-area-inset-bottom); }
+}

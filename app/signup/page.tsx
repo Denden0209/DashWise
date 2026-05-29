@@ -2,7 +2,13 @@
 import { useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
-import { createUserWithEmailAndPassword, updateProfile, GoogleAuthProvider, signInWithPopup } from "firebase/auth";
+import {
+  createUserWithEmailAndPassword,
+  updateProfile,
+  GoogleAuthProvider,
+  signInWithPopup,
+  sendEmailVerification,
+} from "firebase/auth";
 import { auth } from "@/lib/firebase";
 import { C, radius, shadow, input, label, btnPrimary } from "@/lib/styles";
 
@@ -15,79 +21,178 @@ const GIcon = () => (
   </svg>
 );
 
+type FieldError = { name?: string; email?: string; pass?: string; confirm?: string };
+
+function validate(name: string, email: string, pass: string, confirm: string): FieldError {
+  const errors: FieldError = {};
+  if (!name.trim())              errors.name    = "Full name is required.";
+  if (!email.includes("@"))      errors.email   = "Enter a valid email address.";
+  if (pass.length < 8)           errors.pass    = "Password must be at least 8 characters.";
+  if (!/[A-Z]/.test(pass))       errors.pass    = "Password must contain an uppercase letter.";
+  if (!/[0-9]/.test(pass))       errors.pass    = "Password must contain a number.";
+  if (pass !== confirm)          errors.confirm  = "Passwords do not match.";
+  return errors;
+}
+
 export default function SignupPage() {
   const router = useRouter();
   const [name,    setName]    = useState("");
   const [email,   setEmail]   = useState("");
   const [pass,    setPass]    = useState("");
-  const [error,   setError]   = useState("");
+  const [confirm, setConfirm] = useState("");
+  const [showP,   setShowP]   = useState(false);
+  const [errors,  setErrors]  = useState<FieldError>({});
   const [loading, setLoading] = useState(false);
+  const [sent,    setSent]    = useState(false);
 
   async function onSignup(e: React.FormEvent) {
     e.preventDefault();
-    if (pass.length < 6) { setError("Password must be at least 6 characters."); return; }
-    setLoading(true); setError("");
+    const errs = validate(name, email, pass, confirm);
+    if (Object.keys(errs).length > 0) { setErrors(errs); return; }
+    setErrors({}); setLoading(true);
     try {
-      const c = await createUserWithEmailAndPassword(auth, email, pass);
-      await updateProfile(c.user, { displayName: name });
-      router.push("/onboarding");
+      const cred = await createUserWithEmailAndPassword(auth, email, pass);
+      await updateProfile(cred.user, { displayName: name });
+      await sendEmailVerification(cred.user, {
+        url: `${window.location.origin}/onboarding`,
+      });
+      setSent(true);
     } catch (err: unknown) {
-      const m = err instanceof Error ? err.message : "";
-      setError(m.includes("email-already-in-use") ? "An account with this email already exists." : "Signup failed. Try again.");
+      const code = (err as { code?: string }).code || "";
+      if (code === "auth/email-already-in-use")
+        setErrors({ email: "An account with this email already exists." });
+      else if (code === "auth/invalid-email")
+        setErrors({ email: "Invalid email address." });
+      else if (code === "auth/weak-password")
+        setErrors({ pass: "Password is too weak." });
+      else
+        setErrors({ email: "Signup failed. Please try again." });
     } finally { setLoading(false); }
   }
 
   async function onGoogle() {
-    setLoading(true); setError("");
-    try { await signInWithPopup(auth, new GoogleAuthProvider()); router.push("/onboarding"); }
-    catch { setError("Google sign-in failed. Please try again."); }
-    finally { setLoading(false); }
+    setLoading(true); setErrors({});
+    try {
+      await signInWithPopup(auth, new GoogleAuthProvider());
+      router.push("/onboarding");
+    } catch (err: unknown) {
+      const code = (err as { code?: string }).code || "";
+      if (code !== "auth/popup-closed-by-user")
+        setErrors({ email: "Google sign-in failed. Please try again." });
+    } finally { setLoading(false); }
   }
+
+  // ── Email sent confirmation screen ──
+  if (sent) return (
+    <div style={{ minHeight:"100vh", background:C.bg, display:"flex", alignItems:"center", justifyContent:"center", padding:24 }}>
+      <div style={{ width:"100%", maxWidth:420, textAlign:"center" }}>
+        <div style={{ fontSize:64, marginBottom:20 }}>📧</div>
+        <h1 style={{ fontSize:24, fontWeight:700, color:C.text, marginBottom:10 }}>Check your email</h1>
+        <p style={{ fontSize:14, color:C.text3, marginBottom:6, lineHeight:1.6 }}>
+          We sent a verification link to <strong style={{ color:C.text }}>{email}</strong>
+        </p>
+        <p style={{ fontSize:13, color:C.text3, marginBottom:28, lineHeight:1.6 }}>
+          Click the link in the email to verify your account, then you can sign in.
+        </p>
+        <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, padding:20, marginBottom:20, boxShadow:shadow.sm }}>
+          <p style={{ fontSize:13, color:C.text2, marginBottom:12 }}>Didn&apos;t get it? Check your spam folder or:</p>
+          <button onClick={async () => {
+            try {
+              const user = auth.currentUser;
+              if (user) await sendEmailVerification(user);
+              alert("Verification email resent!");
+            } catch { alert("Please try again in a minute."); }
+          }} style={{ ...btnPrimary, width:"100%", padding:"11px", borderRadius:radius.sm, fontSize:14 }}>
+            Resend verification email
+          </button>
+        </div>
+        <Link href="/login" style={{ fontSize:14, color:C.blue, fontWeight:500 }}>
+          ← Back to sign in
+        </Link>
+      </div>
+    </div>
+  );
+
+  const inp = (err?: string): React.CSSProperties => ({
+    ...input,
+    borderColor: err ? C.red : C.border,
+    boxShadow: err ? `0 0 0 3px rgba(255,59,48,0.1)` : "none",
+  });
 
   return (
     <div style={{ minHeight:"100vh", background:C.bg, display:"flex", alignItems:"center", justifyContent:"center", padding:24 }}>
       <div style={{ width:"100%", maxWidth:420 }}>
-        <div style={{ textAlign:"center", marginBottom:36 }}>
+        <div style={{ textAlign:"center", marginBottom:32 }}>
           <Link href="/" style={{ fontSize:26, fontWeight:700, letterSpacing:"-0.5px", color:C.text }}>
             Dash<span style={{ color:C.blue }}>Wise</span>
           </Link>
-          <div style={{ fontSize:22, fontWeight:600, color:C.text, marginTop:20, marginBottom:5 }}>Create your account</div>
-          <div style={{ fontSize:14, color:C.text3 }}>Your AI business advisor is 2 minutes away</div>
+          <div style={{ fontSize:22, fontWeight:600, color:C.text, marginTop:20, marginBottom:4 }}>Create your account</div>
+          <div style={{ fontSize:14, color:C.text3 }}>Your AI business advisor in 2 minutes</div>
         </div>
 
-        <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.xl, padding:32, boxShadow:shadow.md }}>
-          {error && (
-            <div style={{ background:C.redBg, border:"1px solid #ffd6d6", color:C.red, fontSize:13, padding:"10px 14px", borderRadius:radius.sm, marginBottom:20 }}>
-              {error}
-            </div>
-          )}
+        <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.xl, padding:"28px 28px", boxShadow:shadow.md }}>
 
-          <button onClick={onGoogle} disabled={loading} style={{ width:"100%", display:"flex", alignItems:"center", justifyContent:"center", gap:10, background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"12px 16px", fontSize:14, fontWeight:500, color:C.text, cursor:"pointer", marginBottom:20, boxShadow:shadow.sm }}>
+          {/* Google */}
+          <button onClick={onGoogle} disabled={loading} style={{ width:"100%", display:"flex", alignItems:"center", justifyContent:"center", gap:10, background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"12px", fontSize:14, fontWeight:500, color:C.text, cursor:"pointer", marginBottom:20, boxShadow:shadow.sm }}>
             <GIcon /> Continue with Google
           </button>
 
           <div style={{ display:"flex", alignItems:"center", gap:12, marginBottom:20 }}>
-            <div style={{ flex:1, height:1, background:C.border }}/>
-            <span style={{ fontSize:12, color:C.text3 }}>or sign up with email</span>
-            <div style={{ flex:1, height:1, background:C.border }}/>
+            <div style={{ flex:1, height:1, background:C.border }}/><span style={{ fontSize:12, color:C.text3 }}>or sign up with email</span><div style={{ flex:1, height:1, background:C.border }}/>
           </div>
 
           <form onSubmit={onSignup} style={{ display:"flex", flexDirection:"column", gap:16 }}>
-            {[
-              { lbl:"Full name",  val:name,  set:setName,  type:"text",     ph:"Maria Santos"     },
-              { lbl:"Email",      val:email, set:setEmail, type:"email",    ph:"you@company.com"  },
-              { lbl:"Password",   val:pass,  set:setPass,  type:"password", ph:"Min. 6 characters"},
-            ].map(f => (
-              <div key={f.lbl}>
-                <label style={label}>{f.lbl}</label>
-                <input type={f.type} required value={f.val} onChange={e=>f.set(e.target.value)} placeholder={f.ph} style={input}/>
+            {/* Name */}
+            <div>
+              <label style={label}>Full name</label>
+              <input value={name} onChange={e=>{setName(e.target.value);setErrors(p=>({...p,name:undefined}));}} placeholder="Maria Santos" style={inp(errors.name)} autoComplete="name"/>
+              {errors.name && <div style={{ fontSize:12, color:C.red, marginTop:4 }}>⚠ {errors.name}</div>}
+            </div>
+
+            {/* Email */}
+            <div>
+              <label style={label}>Email address</label>
+              <input type="email" value={email} onChange={e=>{setEmail(e.target.value);setErrors(p=>({...p,email:undefined}));}} placeholder="you@company.com" style={inp(errors.email)} autoComplete="email"/>
+              {errors.email && <div style={{ fontSize:12, color:C.red, marginTop:4 }}>⚠ {errors.email}</div>}
+            </div>
+
+            {/* Password */}
+            <div>
+              <label style={label}>Password</label>
+              <div style={{ position:"relative" }}>
+                <input type={showP?"text":"password"} value={pass} onChange={e=>{setPass(e.target.value);setErrors(p=>({...p,pass:undefined}));}} placeholder="Min. 8 characters" style={{ ...inp(errors.pass), paddingRight:56 }} autoComplete="new-password"/>
+                <button type="button" onClick={()=>setShowP(!showP)} style={{ position:"absolute", right:12, top:"50%", transform:"translateY(-50%)", background:"none", border:"none", color:C.text3, fontSize:12, cursor:"pointer" }}>
+                  {showP?"Hide":"Show"}
+                </button>
               </div>
-            ))}
+              {errors.pass && <div style={{ fontSize:12, color:C.red, marginTop:4 }}>⚠ {errors.pass}</div>}
+              {/* Password strength hints */}
+              {pass.length > 0 && (
+                <div style={{ display:"flex", gap:6, marginTop:6 }}>
+                  {[{ label:"8+ chars", ok:pass.length>=8 }, { label:"Uppercase", ok:/[A-Z]/.test(pass) }, { label:"Number", ok:/[0-9]/.test(pass) }].map(h=>(
+                    <span key={h.label} style={{ fontSize:11, padding:"2px 8px", borderRadius:20, background:h.ok?"#f0faf4":C.bg, color:h.ok?"#34c759":C.text3, border:`1px solid ${h.ok?"#c8f0d8":C.border}` }}>
+                      {h.ok?"✓":""} {h.label}
+                    </span>
+                  ))}
+                </div>
+              )}
+            </div>
+
+            {/* Confirm password */}
+            <div>
+              <label style={label}>Confirm password</label>
+              <input type="password" value={confirm} onChange={e=>{setConfirm(e.target.value);setErrors(p=>({...p,confirm:undefined}));}} placeholder="Re-enter password" style={inp(errors.confirm)} autoComplete="new-password"/>
+              {errors.confirm && <div style={{ fontSize:12, color:C.red, marginTop:4 }}>⚠ {errors.confirm}</div>}
+            </div>
+
             <button type="submit" disabled={loading} style={{ ...btnPrimary, width:"100%", padding:"13px", borderRadius:radius.sm, fontSize:15, opacity:loading?.6:1, marginTop:4 }}>
               {loading ? "Creating account..." : "Create free account"}
             </button>
-            <p style={{ fontSize:11, color:C.text3, textAlign:"center" }}>
-              By signing up you agree to our Terms and Privacy Policy.
+
+            <p style={{ fontSize:11, color:C.text3, textAlign:"center" as const }}>
+              By signing up you agree to our{" "}
+              <Link href="/terms" style={{ color:C.blue }}>Terms</Link> and{" "}
+              <Link href="/privacy" style={{ color:C.blue }}>Privacy Policy</Link>.
             </p>
           </form>
         </div>
