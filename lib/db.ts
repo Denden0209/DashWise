@@ -50,24 +50,24 @@ export type BusinessFolder = {
 };
 
 export type FolderFile = {
-  id?:           string;
-  name:          string;
-  size:          number;
-  type:          string;
-  storagePath?:  string;
-  downloadURL?:  string;
+  id?:            string;
+  name:           string;
+  size:           number;
+  type:           string;
+  storagePath?:   string;
+  downloadURL?:   string;
   parsedContent?: string;
-  sheets?:       string[];
-  rowCount?:     number;
-  status:        string;
-  uploadedAt?:   unknown;
+  sheets?:        string[];
+  rowCount?:      number;
+  status:         string;
+  uploadedAt?:    unknown;
 };
 
 export type ChatMessage = {
-  id?:       string;
-  role:      "user" | "assistant";
-  content:   string;
-  type?:     string;
+  id?:        string;
+  role:       "user" | "assistant";
+  content:    string;
+  type?:      string;
   timestamp?: unknown;
 };
 
@@ -77,7 +77,7 @@ export async function getUserProfile(uid: string): Promise<BusinessProfile | nul
     try {
       const snap = await getDoc(doc(db, "users", uid));
       return snap.exists() ? (snap.data() as BusinessProfile) : null;
-    } catch (e: unknown) {
+    } catch {
       if (i === 2) return null;
       await new Promise(r => setTimeout(r, 500 * (i + 1)));
     }
@@ -109,7 +109,8 @@ export async function getUserFolders(uid: string): Promise<BusinessFolder[]> {
 
 export async function saveFolderAnalysis(uid: string, folderId: string, summary: string): Promise<void> {
   await updateDoc(doc(db, "users", uid, "folders", folderId), {
-    lastAnalysisSummary: summary, lastAnalyzedAt: serverTimestamp(),
+    lastAnalysisSummary: summary,
+    lastAnalyzedAt:      serverTimestamp(),
   });
 }
 
@@ -162,23 +163,66 @@ export async function getRecentChats(uid: string, n = 30): Promise<ChatMessage[]
   return snap.docs.map(d => ({ id: d.id, ...d.data() } as ChatMessage));
 }
 
-// ── Cross-folder business data ─────────────────────────────
-export async function getAllBusinessData(uid: string) {
-  const folders = await getUserFolders(uid);
+// ── Full business data ─────────────────────────────────────
+// Returns ALL folders and ALL files with COMPLETE parsed content.
+// Used by the advisor to understand the entire business.
+// No character truncation — the chat API handles context management.
+export async function getAllBusinessData(uid: string): Promise<{
+  folderCount:     number;
+  fileCount:       number;
+  totalDataSize:   number;  // total characters across all files
+  folderSummaries: {
+    folderId:      string;
+    folderName:    string;
+    fileNames:     string[];
+    fileTypes:     string[];
+    fileCount:     number;
+    readyCount:    number;
+    parsedContent: string;  // FULL content — no truncation
+    lastAnalysis:  string;
+  }[];
+}> {
+  const folders   = await getUserFolders(uid);
   const summaries = [];
+  let   totalSize = 0;
+
   for (const folder of folders) {
-    const files   = await getFolderFiles(uid, folder.id!);
-    const ready   = files.filter(f => f.status === "ready");
-    const content = ready.map(f => `[${f.name}]: ${(f.parsedContent || "").slice(0, 1500)}`).join("\n\n");
+    const files     = await getFolderFiles(uid, folder.id!);
+    const ready     = files.filter(f => f.status === "ready" && f.parsedContent);
+
+    // Build FULL content for all ready files in this folder
+    // Each file gets a clear header so Claude knows which file each section came from
+    const combined = ready.map(f => {
+      const content = f.parsedContent || "";
+      totalSize    += content.length;
+      return [
+        `┌─── FILE: ${f.name} (${f.type.toUpperCase()}) ───`,
+        f.rowCount ? `│ Rows: ${f.rowCount}` : "",
+        f.sheets?.length ? `│ Sheets: ${f.sheets.join(", ")}` : "",
+        `│`,
+        content,
+        `└─── END: ${f.name} ───`,
+      ].filter(Boolean).join("\n");
+    }).join("\n\n");
+
     summaries.push({
+      folderId:      folder.id!,
       folderName:    folder.bizName,
       fileNames:     files.map(f => f.name),
       fileTypes:     [...new Set(files.map(f => f.type))],
-      parsedContent: content,
+      fileCount:     files.length,
+      readyCount:    ready.length,
+      parsedContent: combined,
       lastAnalysis:  folder.lastAnalysisSummary || "",
     });
   }
-  return { folderCount: folders.length, fileCount: folders.reduce((s, f) => s + f.fileCount, 0), folderSummaries: summaries };
+
+  return {
+    folderCount:     folders.length,
+    fileCount:       folders.reduce((s, f) => s + f.fileCount, 0),
+    totalDataSize:   totalSize,
+    folderSummaries: summaries,
+  };
 }
 
 export async function checkUsageLimit(uid: string): Promise<boolean> {

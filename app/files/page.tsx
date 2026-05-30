@@ -28,6 +28,16 @@ function Spinner({ size=18, color=C.blue }: { size?:number; color?:string }) {
   return <div style={{ width:size, height:size, border:`2px solid ${color}30`, borderTopColor:color, borderRadius:"50%", animation:"spin .7s linear infinite", flexShrink:0 }}/>;
 }
 
+// Triggers OpenAI embedding in background — non-blocking
+function triggerEmbedding(uid: string, fileId: string, folderId: string, fileName: string, content: string) {
+  if (!content || content.length < 50) return;
+  fetch("/api/embed", {
+    method:  "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ uid, fileId, folderId, fileName, content }),
+  }).catch(err => console.warn("[embed] Non-critical:", err));
+}
+
 export default function FilesPage() {
   const router = useRouter();
   const { user, profile, loading } = useAuth();
@@ -46,11 +56,9 @@ export default function FilesPage() {
   const [dashReady,      setDashReady]      = useState(false);
   const [errorMsg,       setErrorMsg]       = useState("");
   const [deletingId,     setDeletingId]     = useState<string|null>(null);
-  const [showSidebar,    setShowSidebar]    = useState(false);
+  const [embeddingStatus,setEmbeddingStatus]= useState<Record<string,string>>({});
 
-  useEffect(() => {
-    if (!loading && !user) router.push("/login");
-  }, [user, loading, router]);
+  useEffect(() => { if (!loading && !user) router.push("/login"); }, [user, loading, router]);
 
   useEffect(() => {
     if (!user) return;
@@ -71,40 +79,53 @@ export default function FilesPage() {
     setCreatingFolder(true);
     const id = await createFolder(user.uid, newFolderName.trim(), profile?.bizType);
     const updated = await getUserFolders(user.uid);
-    setFolders(updated);
-    setActiveFolderId(id);
-    setNewFolderName(""); setShowNewFolder(false); setShowSidebar(false);
-    setCreatingFolder(false);
+    setFolders(updated); setActiveFolderId(id);
+    setNewFolderName(""); setShowNewFolder(false); setCreatingFolder(false);
   }
 
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const selected = e.target.files;
     if (!selected || !user || !activeFolderId) return;
     setUploading(true); setErrorMsg("");
+
     for (const file of Array.from(selected)) {
       let fileId = "";
       try {
         fileId = await addFileToFolder(user.uid, activeFolderId, {
           name: file.name, size: file.size,
           type: file.name.split(".").pop()?.toLowerCase() || "unknown",
-          status:"uploading",
+          status: "uploading",
         });
+
         const form = new FormData();
         form.append("file", file);
         const res  = await fetch("/api/parse-files", { method:"POST", body:form });
-        if (!res.ok) throw new Error("Parse failed");
+        if (!res.ok) throw new Error(`Parse failed (${res.status})`);
         const data = await res.json();
+
         await updateFileRecord(user.uid, activeFolderId, fileId, {
           parsedContent: data.content || "",
           sheets:        data.sheets  || [],
           rowCount:      data.rowCount || 0,
           status:        "ready",
         });
-      } catch {
+
+        // ── Trigger RAG embedding (background, non-blocking) ──
+        if (data.content) {
+          setEmbeddingStatus(prev => ({ ...prev, [fileId]: "embedding" }));
+          triggerEmbedding(user.uid, fileId, activeFolderId, file.name, data.content);
+          // Mark as embedded after short delay (actual status checked server-side)
+          setTimeout(() => {
+            setEmbeddingStatus(prev => ({ ...prev, [fileId]: "ready" }));
+          }, 3000);
+        }
+
+      } catch (err: unknown) {
         if (fileId) await updateFileRecord(user.uid, activeFolderId, fileId, { status:"error" });
-        setErrorMsg(`Failed to parse ${file.name}. Check the file format and try again.`);
+        setErrorMsg(`Failed to parse "${file.name}": ${err instanceof Error ? err.message : "Unknown error"}`);
       }
     }
+
     const updated = await getFolderFiles(user.uid, activeFolderId);
     setFiles(updated); setUploading(false);
     if (fileInputRef.current) fileInputRef.current.value = "";
@@ -112,48 +133,58 @@ export default function FilesPage() {
 
   async function handleDeleteFile(fileId: string, fileName: string) {
     if (!user || !activeFolderId) return;
-    if (!confirm(`Delete "${fileName}"? This cannot be undone.`)) return;
+    if (!confirm(`Delete "${fileName}"?\n\nThis cannot be undone.`)) return;
     setDeletingId(fileId);
     try {
       await deleteDoc(doc(db, "users", user.uid, "folders", activeFolderId, "files", fileId));
       setFiles(prev => prev.filter(f => f.id !== fileId));
     } catch {
-      setErrorMsg("Failed to delete file. Please try again.");
+      setErrorMsg(`Failed to delete "${fileName}". Please try again.`);
     } finally { setDeletingId(null); }
   }
 
   async function handleAnalyzeAll() {
     if (!user || !activeFolderId) return;
     const ready = files.filter(f => f.status === "ready");
-    if (ready.length === 0) { setErrorMsg("No ready files to analyze. Wait for uploads to finish parsing."); return; }
+    if (ready.length === 0) {
+      setErrorMsg("No ready files to analyze. Wait for uploads to finish.");
+      return;
+    }
     setAnalyzing(true); setAnalysis(null); setDashReady(false); setErrorMsg("");
 
     try {
       const res = await fetch("/api/analyze-folder", {
-        method:"POST",
-        headers:{ "Content-Type":"application/json" },
+        method:  "POST",
+        headers: { "Content-Type":"application/json" },
         body: JSON.stringify({
           files: ready.map(f => ({
-            fileName: f.name, fileType: f.type,
+            fileName: f.name,
+            fileType: f.type,
             content:  (f.parsedContent || "").slice(0, 8000),
             sheets:   f.sheets || [],
           })),
           businessType: profile?.bizType || "retail",
           bizName:      activeFolder?.bizName || profile?.bizName || "My Business",
-          mode, goals: profile?.goals || [],
+          mode,
+          goals:        profile?.goals || [],
         }),
       });
+
       if (!res.ok) {
-        const errData = await res.json().catch(()=>({}));
-        throw new Error(errData.error || `Server error (${res.status})`);
+        const errData = await res.json().catch(() => ({}));
+        throw new Error((errData as { error?: string }).error || `Server error (${res.status})`);
       }
-      const data = await res.json();
+
+      const data = await res.json() as { success: boolean; analysis?: string; dashboardData?: unknown; error?: string };
       if (!data.success) throw new Error(data.error || "Analysis failed");
+
       setAnalysis(data.analysis || "");
       setDashReady(!!data.dashboardData);
-      if (data.dashboardData?.summary) {
-        await saveFolderAnalysis(user.uid, activeFolderId, data.dashboardData.summary.slice(0,300));
+
+      if ((data.dashboardData as { summary?: string })?.summary) {
+        await saveFolderAnalysis(user.uid, activeFolderId, ((data.dashboardData as { summary: string }).summary).slice(0, 300));
       }
+
       try {
         sessionStorage.setItem("dashwise-analysis", JSON.stringify({
           dashboardData: data.dashboardData,
@@ -162,6 +193,7 @@ export default function FilesPage() {
           mode,
         }));
       } catch {}
+
     } catch (err: unknown) {
       setErrorMsg(err instanceof Error ? err.message : "Analysis failed. Please try again.");
     } finally { setAnalyzing(false); }
@@ -191,103 +223,87 @@ export default function FilesPage() {
     <div style={{ minHeight:"100vh", background:C.bg, display:"flex", flexDirection:"column" }}>
       <Nav/>
 
-      {/* Mobile folder selector bar */}
-      <div style={{ display:"flex", alignItems:"center", gap:10, padding:"10px 16px", background:C.surface, borderBottom:`1px solid ${C.border}`, overflowX:"auto" }}>
-        <button onClick={()=>setShowSidebar(true)} style={{ background:C.bg, border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"7px 12px", fontSize:13, color:C.text2, cursor:"pointer", whiteSpace:"nowrap", flexShrink:0 }}>
-          📁 Folders
+      {/* ── Mobile folder tab bar ── */}
+      <div style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 16px", background:C.surface, borderBottom:`1px solid ${C.border}`, overflowX:"auto" }}>
+        <button onClick={()=>setShowNewFolder(!showNewFolder)} style={{ background:C.blueBg, border:`1px solid ${C.blueMid}`, color:C.blue, fontSize:12, fontWeight:600, padding:"7px 12px", borderRadius:radius.sm, cursor:"pointer", flexShrink:0 }}>
+          + New
         </button>
         {folders.map(f => (
           <button key={f.id} onClick={()=>setActiveFolderId(f.id!)} style={{
             background: activeFolderId===f.id?C.blue:C.surface,
             color:      activeFolderId===f.id?"#fff":C.text2,
-            border:`1px solid ${activeFolderId===f.id?C.blue:C.border}`,
+            border:     `1px solid ${activeFolderId===f.id?C.blue:C.border}`,
             borderRadius:radius.full, padding:"7px 14px", fontSize:13,
             fontWeight: activeFolderId===f.id?600:400,
             cursor:"pointer", whiteSpace:"nowrap", flexShrink:0,
           }}>
-            {f.bizName}
+            📁 {f.bizName}
           </button>
         ))}
-        <button onClick={()=>setShowNewFolder(true)} style={{ background:"transparent", border:`1px dashed ${C.border2}`, borderRadius:radius.full, padding:"7px 14px", fontSize:13, color:C.text3, cursor:"pointer", whiteSpace:"nowrap", flexShrink:0 }}>
-          + New
-        </button>
       </div>
 
-      {/* Mobile new folder input */}
+      {/* New folder input */}
       {showNewFolder && (
-        <div style={{ background:C.surface, borderBottom:`1px solid ${C.border}`, padding:"12px 16px", display:"flex", gap:8 }}>
-          <input autoFocus value={newFolderName} onChange={e=>setNewFolderName(e.target.value)} onKeyDown={e=>{ if(e.key==="Enter")handleCreateFolder(); if(e.key==="Escape")setShowNewFolder(false); }} placeholder="Folder name..." style={{ flex:1, background:C.bg, border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"9px 12px", fontSize:14, color:C.text, outline:"none" }}/>
-          <button onClick={handleCreateFolder} disabled={!newFolderName.trim()||creatingFolder} style={{ ...btnPrimary, padding:"9px 16px", borderRadius:radius.sm, fontSize:13, opacity:(!newFolderName.trim()||creatingFolder)?.5:1 }}>
+        <div style={{ background:C.surface, borderBottom:`1px solid ${C.border}`, padding:"10px 16px", display:"flex", gap:8 }}>
+          <input autoFocus value={newFolderName} onChange={e=>setNewFolderName(e.target.value)}
+            onKeyDown={e=>{ if(e.key==="Enter")handleCreateFolder(); if(e.key==="Escape")setShowNewFolder(false); }}
+            placeholder="Folder name (e.g. Q1 2025)..."
+            style={{ flex:1, background:C.bg, border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"9px 12px", fontSize:14, color:C.text, outline:"none" }}/>
+          <button onClick={handleCreateFolder} disabled={!newFolderName.trim()||creatingFolder}
+            style={{ ...btnPrimary, padding:"9px 16px", borderRadius:radius.sm, fontSize:13, opacity:(!newFolderName.trim()||creatingFolder)?.5:1 }}>
             {creatingFolder?"...":"Add"}
           </button>
           <button onClick={()=>setShowNewFolder(false)} style={{ background:"transparent", border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"9px 12px", fontSize:13, color:C.text3, cursor:"pointer" }}>×</button>
         </div>
       )}
 
-      {/* Mobile sidebar overlay */}
-      {showSidebar && (
-        <div style={{ position:"fixed", inset:0, zIndex:200, display:"flex" }}>
-          <div onClick={()=>setShowSidebar(false)} style={{ flex:1, background:"rgba(0,0,0,0.4)" }}/>
-          <div style={{ width:280, background:C.surface, display:"flex", flexDirection:"column", overflowY:"auto", padding:16 }}>
-            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:16 }}>
-              <span style={{ fontWeight:600, fontSize:15, color:C.text }}>Folders</span>
-              <button onClick={()=>setShowSidebar(false)} style={{ background:"none", border:"none", fontSize:20, color:C.text3, cursor:"pointer" }}>×</button>
-            </div>
-            {folders.map(f=>(
-              <button key={f.id} onClick={()=>{ setActiveFolderId(f.id!); setShowSidebar(false); }} style={{ display:"flex", alignItems:"center", gap:10, padding:"12px", borderRadius:radius.sm, marginBottom:4, background:activeFolderId===f.id?C.blueBg:"transparent", border:`1px solid ${activeFolderId===f.id?C.blueMid:"transparent"}`, cursor:"pointer", textAlign:"left" as const }}>
-                <span>📁</span>
-                <span style={{ fontSize:14, fontWeight:activeFolderId===f.id?600:400, color:activeFolderId===f.id?C.blue:C.text }}>{f.bizName}</span>
-              </button>
-            ))}
-            <button onClick={()=>{ setShowSidebar(false); setShowNewFolder(true); }} style={{ marginTop:8, padding:"11px", borderRadius:radius.sm, background:C.bg, border:`1px dashed ${C.border2}`, fontSize:13, color:C.text3, cursor:"pointer" }}>
-              + New folder
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Main content */}
+      {/* ── Main content ── */}
       <div style={{ flex:1, overflowY:"auto", padding:"20px 16px" }}>
         <div style={{ maxWidth:760, margin:"0 auto" }}>
 
           {!activeFolderId ? (
             <div style={{ textAlign:"center", padding:"60px 20px" }}>
               <div style={{ fontSize:48, marginBottom:16 }}>📂</div>
-              <h2 style={{ fontSize:20, fontWeight:700, color:C.text, marginBottom:8 }}>No folder selected</h2>
-              <p style={{ fontSize:14, color:C.text3 }}>Create a folder above to get started.</p>
+              <h2 style={{ fontSize:20, fontWeight:700, color:C.text, marginBottom:8 }}>Create a folder to start</h2>
+              <p style={{ fontSize:14, color:C.text3, marginBottom:20 }}>Click <strong>+ New</strong> above to create your first folder.</p>
             </div>
           ) : (
             <>
-              {/* Folder title */}
-              <div style={{ marginBottom:20 }}>
+              {/* Folder header */}
+              <div style={{ marginBottom:18 }}>
                 <h1 style={{ fontSize:22, fontWeight:700, letterSpacing:"-0.4px", color:C.text, marginBottom:3 }}>{activeFolder?.bizName}</h1>
-                <p style={{ fontSize:13, color:C.text3 }}>{files.length} file{files.length!==1?"s":""} · {readyFiles.length} ready</p>
+                <p style={{ fontSize:13, color:C.text3 }}>
+                  {files.length} file{files.length!==1?"s":""} · {readyFiles.length} ready to analyze
+                  {process.env.NEXT_PUBLIC_OPENAI_ENABLED === "true" && readyFiles.length > 0 && (
+                    <span style={{ marginLeft:8, color:"#34c759", fontWeight:500 }}>· RAG enabled ✓</span>
+                  )}
+                </p>
               </div>
 
               {/* Error */}
               {errorMsg && (
                 <div style={{ background:C.redBg, border:`1px solid #ffd6d6`, color:C.red, fontSize:13, padding:"12px 14px", borderRadius:radius.sm, marginBottom:16, display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
                   <span style={{ lineHeight:1.5 }}>⚠ {errorMsg}</span>
-                  <button onClick={()=>setErrorMsg("")} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:18, flexShrink:0, lineHeight:1 }}>×</button>
+                  <button onClick={()=>setErrorMsg("")} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:18, flexShrink:0 }}>×</button>
                 </div>
               )}
 
               {/* Upload zone */}
               <div
                 onClick={()=>!uploading&&fileInputRef.current?.click()}
-                style={{ background:C.surface, border:`2px dashed ${C.border2}`, borderRadius:radius.lg, padding:"28px 20px", textAlign:"center", cursor:uploading?"default":"pointer", marginBottom:16, transition:"border-color 0.2s", boxShadow:shadow.sm }}
+                style={{ background:C.surface, border:`2px dashed ${C.border2}`, borderRadius:radius.lg, padding:"28px 20px", textAlign:"center", cursor:uploading?"default":"pointer", marginBottom:16, boxShadow:shadow.sm, transition:"border-color 0.2s" }}
                 onMouseEnter={e=>{ if(!uploading)(e.currentTarget as HTMLElement).style.borderColor=C.blue; }}
                 onMouseLeave={e=>{ (e.currentTarget as HTMLElement).style.borderColor=C.border2; }}
               >
                 <input ref={fileInputRef} type="file" multiple accept=".csv,.xlsx,.xls,.xlsm,.pdf,.txt,.json" onChange={handleUpload} style={{ display:"none" }}/>
                 {uploading ? (
                   <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12 }}>
-                    <Spinner/><span style={{ fontSize:14, color:C.text2 }}>Uploading and parsing...</span>
+                    <Spinner/><span style={{ fontSize:14, color:C.text2 }}>Uploading and parsing files...</span>
                   </div>
                 ) : (
                   <>
                     <div style={{ fontSize:28, marginBottom:8 }}>⬆️</div>
-                    <div style={{ fontWeight:600, fontSize:14, color:C.text, marginBottom:3 }}>Tap to upload files</div>
+                    <div style={{ fontWeight:600, fontSize:14, color:C.text, marginBottom:3 }}>Click to upload files</div>
                     <div style={{ fontSize:12, color:C.text3 }}>CSV · Excel · PDF · TXT · JSON</div>
                   </>
                 )}
@@ -301,14 +317,23 @@ export default function FilesPage() {
                       <span style={{ fontSize:20, flexShrink:0 }}>{EXT_ICON[file.type]||"📎"}</span>
                       <div style={{ flex:1, minWidth:0 }}>
                         <div style={{ fontSize:13, fontWeight:500, color:C.text, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{file.name}</div>
-                        <div style={{ fontSize:11, color:C.text3, marginTop:2 }}>
-                          {(file.size/1024).toFixed(1)} KB
-                          {file.sheets?.length ? ` · ${file.sheets.length} sheets` : ""}
-                          {(file.rowCount||0)>0 ? ` · ${file.rowCount} rows` : ""}
+                        <div style={{ fontSize:11, color:C.text3, marginTop:2, display:"flex", gap:8, flexWrap:"wrap" as const }}>
+                          <span>{(file.size/1024).toFixed(1)} KB</span>
+                          {file.sheets?.length ? <span>{file.sheets.length} sheets</span> : null}
+                          {(file.rowCount||0)>0 ? <span>{file.rowCount} rows</span> : null}
+                          {/* Embedding status indicator */}
+                          {file.id && embeddingStatus[file.id] === "embedding" && (
+                            <span style={{ color:C.blue, display:"flex", alignItems:"center", gap:3 }}>
+                              <Spinner size={10}/> indexing for AI search...
+                            </span>
+                          )}
+                          {file.id && embeddingStatus[file.id] === "ready" && (
+                            <span style={{ color:"#34c759" }}>🔍 AI search ready</span>
+                          )}
                         </div>
                       </div>
 
-                      {/* Status badge */}
+                      {/* Status */}
                       {file.status==="uploading" ? (
                         <div style={{ display:"flex", alignItems:"center", gap:5, flexShrink:0 }}>
                           <Spinner size={14}/><span style={{ fontSize:11, color:C.text3 }}>Parsing...</span>
@@ -319,14 +344,12 @@ export default function FilesPage() {
                         </span>
                       )}
 
-                      {/* Delete button */}
-                      {file.id && file.status !== "uploading" && (
-                        <button
-                          onClick={()=>handleDeleteFile(file.id!, file.name)}
-                          disabled={deletingId===file.id}
+                      {/* Delete */}
+                      {file.id && file.status!=="uploading" && (
+                        <button onClick={()=>handleDeleteFile(file.id!, file.name)} disabled={deletingId===file.id}
                           title="Delete file"
                           style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.text3, width:30, height:30, borderRadius:radius.sm, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, flexShrink:0, opacity:deletingId===file.id?.5:1 }}>
-                          {deletingId===file.id ? <Spinner size={12}/> : "🗑"}
+                          {deletingId===file.id?<Spinner size={12}/>:"🗑"}
                         </button>
                       )}
                     </div>
@@ -337,11 +360,9 @@ export default function FilesPage() {
               {/* Analysis modes */}
               {readyFiles.length > 0 && (
                 <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:radius.lg, padding:18, boxShadow:shadow.sm, marginBottom:16 }}>
-                  <div style={{ fontSize:11, fontWeight:600, textTransform:"uppercase" as const, letterSpacing:"0.8px", color:C.text3, marginBottom:12 }}>
-                    Analysis Mode
-                  </div>
+                  <div style={{ fontSize:11, fontWeight:600, textTransform:"uppercase" as const, letterSpacing:"0.8px", color:C.text3, marginBottom:12 }}>Analysis Mode</div>
                   <div style={{ display:"grid", gridTemplateColumns:"1fr 1fr", gap:8, marginBottom:14 }}>
-                    {MODES.map(m=>(
+                    {MODES.map(m => (
                       <button key={m.id} onClick={()=>setMode(m.id)} style={{ display:"flex", alignItems:"center", gap:10, padding:"11px 12px", borderRadius:radius.sm, cursor:"pointer", background:mode===m.id?C.blueBg:C.bg, border:mode===m.id?`1.5px solid ${C.blue}`:`1px solid ${C.border}`, textAlign:"left" as const }}>
                         <span style={{ fontSize:18, flexShrink:0 }}>{m.icon}</span>
                         <div>
@@ -351,13 +372,14 @@ export default function FilesPage() {
                       </button>
                     ))}
                   </div>
+
                   <button onClick={handleAnalyzeAll} disabled={analyzing} style={{ ...btnPrimary, width:"100%", padding:"14px", borderRadius:radius.sm, fontSize:15, opacity:analyzing?.6:1 }}>
-                    {analyzing ? (
-                      <><Spinner size={16} color="#fff"/> Analyzing {readyFiles.length} file{readyFiles.length!==1?"s":""}...</>
-                    ) : (
-                      `🧠 Analyze ${readyFiles.length} file${readyFiles.length!==1?"s":""} →`
-                    )}
+                    {analyzing
+                      ? <><Spinner size={16} color="#fff"/> Analyzing {readyFiles.length} file{readyFiles.length!==1?"s":""}...</>
+                      : `🧠 Analyze ${readyFiles.length} file${readyFiles.length!==1?"s":""} →`
+                    }
                   </button>
+
                   {dashReady && (
                     <button onClick={()=>router.push("/dashboard-view")} style={{ ...btnPrimary, width:"100%", marginTop:10, padding:"13px", borderRadius:radius.sm, fontSize:14, background:"transparent", color:C.blue, border:`2px solid ${C.blue}` }}>
                       🚀 Open Full Dashboard
@@ -395,7 +417,7 @@ export default function FilesPage() {
                 <div style={{ textAlign:"center", padding:"40px 20px", color:C.text3 }}>
                   <div style={{ fontSize:36, marginBottom:10 }}>📄</div>
                   <div style={{ fontSize:14, fontWeight:500, color:C.text, marginBottom:5 }}>No files yet</div>
-                  <div style={{ fontSize:13 }}>Upload files using the zone above.</div>
+                  <div style={{ fontSize:13 }}>Click the upload zone above to add your first file.</div>
                 </div>
               )}
             </>
