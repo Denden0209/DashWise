@@ -13,6 +13,12 @@ import {
 import Nav from "@/components/Nav";
 import { C, radius, shadow, btnPrimary } from "@/lib/styles";
 
+// ── Limits ────────────────────────────────────────────────
+const MAX_FILE_MB        = 25;          // per file
+const MAX_TOTAL_MB       = 100;         // per upload session
+const MAX_FILES_PER_SESS = 10;          // per session
+const MAX_CONTENT_CHARS  = 800_000;     // ~200K tokens, fits Firestore 1MB doc limit
+
 const MODES = [
   { id:"explain", icon:"💡", label:"Full Report",  desc:"Overall analysis" },
   { id:"meeting", icon:"🗓️", label:"Meeting Prep", desc:"Key talking points" },
@@ -28,12 +34,11 @@ function Spinner({ size=18, color=C.blue }: { size?:number; color?:string }) {
   return <div style={{ width:size, height:size, border:`2px solid ${color}30`, borderTopColor:color, borderRadius:"50%", animation:"spin .7s linear infinite", flexShrink:0 }}/>;
 }
 
-// Triggers OpenAI embedding in background — non-blocking
 function triggerEmbedding(uid: string, fileId: string, folderId: string, fileName: string, content: string) {
   if (!content || content.length < 50) return;
   fetch("/api/embed", {
-    method:  "POST",
-    headers: { "Content-Type": "application/json" },
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
     body: JSON.stringify({ uid, fileId, folderId, fileName, content }),
   }).catch(err => console.warn("[embed] Non-critical:", err));
 }
@@ -43,20 +48,22 @@ export default function FilesPage() {
   const { user, profile, loading } = useAuth();
   const fileInputRef = useRef<HTMLInputElement>(null);
 
-  const [folders,        setFolders]        = useState<BusinessFolder[]>([]);
-  const [activeFolderId, setActiveFolderId] = useState<string|null>(null);
-  const [files,          setFiles]          = useState<FolderFile[]>([]);
-  const [newFolderName,  setNewFolderName]  = useState("");
-  const [creatingFolder, setCreatingFolder] = useState(false);
-  const [showNewFolder,  setShowNewFolder]  = useState(false);
-  const [uploading,      setUploading]      = useState(false);
-  const [mode,           setMode]           = useState("explain");
-  const [analyzing,      setAnalyzing]      = useState(false);
-  const [analysis,       setAnalysis]       = useState<string|null>(null);
-  const [dashReady,      setDashReady]      = useState(false);
-  const [errorMsg,       setErrorMsg]       = useState("");
-  const [deletingId,     setDeletingId]     = useState<string|null>(null);
-  const [embeddingStatus,setEmbeddingStatus]= useState<Record<string,string>>({});
+  const [folders,         setFolders]         = useState<BusinessFolder[]>([]);
+  const [activeFolderId,  setActiveFolderId]   = useState<string|null>(null);
+  const [files,           setFiles]            = useState<FolderFile[]>([]);
+  const [newFolderName,   setNewFolderName]    = useState("");
+  const [creatingFolder,  setCreatingFolder]   = useState(false);
+  const [showNewFolder,   setShowNewFolder]    = useState(false);
+  const [uploading,       setUploading]        = useState(false);
+  const [mode,            setMode]             = useState("explain");
+  const [analyzing,       setAnalyzing]        = useState(false);
+  const [analysis,        setAnalysis]         = useState<string|null>(null);
+  const [dashReady,       setDashReady]        = useState(false);
+  const [errorMsg,        setErrorMsg]         = useState("");
+  const [warnMsg,         setWarnMsg]          = useState("");
+  const [deletingId,      setDeletingId]       = useState<string|null>(null);
+  const [embeddingStatus, setEmbeddingStatus]  = useState<Record<string,string>>({});
+  const [uploadProgress,  setUploadProgress]   = useState<{current:number;total:number}|null>(null);
 
   useEffect(() => { if (!loading && !user) router.push("/login"); }, [user, loading, router]);
 
@@ -86,48 +93,110 @@ export default function FilesPage() {
   async function handleUpload(e: React.ChangeEvent<HTMLInputElement>) {
     const selected = e.target.files;
     if (!selected || !user || !activeFolderId) return;
-    setUploading(true); setErrorMsg("");
 
-    for (const file of Array.from(selected)) {
-      let fileId = "";
+    const fileArray = Array.from(selected);
+    setErrorMsg(""); setWarnMsg("");
+
+    // ── Validate before uploading ─────────────────────────
+    const warnings: string[] = [];
+
+    // Check count limit
+    if (fileArray.length > MAX_FILES_PER_SESS) {
+      setErrorMsg(`Maximum ${MAX_FILES_PER_SESS} files per upload session. You selected ${fileArray.length}. Please split into multiple uploads.`);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
+
+    // Check individual file sizes
+    const oversized = fileArray.filter(f => f.size > MAX_FILE_MB * 1024 * 1024);
+    if (oversized.length > 0) {
+      setErrorMsg(`${oversized.map(f => `"${f.name}" (${(f.size/1024/1024).toFixed(1)}MB)`).join(", ")} exceed${oversized.length === 1 ? "s" : ""} the ${MAX_FILE_MB}MB per-file limit. Please split into smaller files.`);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
+
+    // Check total session size
+    const totalMB = fileArray.reduce((s, f) => s + f.size, 0) / 1024 / 1024;
+    if (totalMB > MAX_TOTAL_MB) {
+      setErrorMsg(`Total upload size is ${totalMB.toFixed(1)}MB — maximum per session is ${MAX_TOTAL_MB}MB. Upload fewer files at once.`);
+      if (fileInputRef.current) fileInputRef.current.value = "";
+      return;
+    }
+
+    // Warn about large files that will be truncated
+    const willTruncate = fileArray.filter(f => f.size > 5 * 1024 * 1024);
+    if (willTruncate.length > 0) {
+      warnings.push(`Files larger than 5MB will be partially indexed (first 800K characters). All data is still searchable via AI.`);
+    }
+
+    if (warnings.length > 0) setWarnMsg(warnings.join(" "));
+
+    // ── Start uploading ───────────────────────────────────
+    setUploading(true);
+    setUploadProgress({ current: 0, total: fileArray.length });
+
+    for (let idx = 0; idx < fileArray.length; idx++) {
+      const file   = fileArray[idx];
+      let   fileId = "";
+      setUploadProgress({ current: idx + 1, total: fileArray.length });
+
       try {
         fileId = await addFileToFolder(user.uid, activeFolderId, {
-          name: file.name, size: file.size,
-          type: file.name.split(".").pop()?.toLowerCase() || "unknown",
+          name:   file.name,
+          size:   file.size,
+          type:   file.name.split(".").pop()?.toLowerCase() || "unknown",
           status: "uploading",
         });
 
         const form = new FormData();
         form.append("file", file);
-        const res  = await fetch("/api/parse-files", { method:"POST", body:form });
-        if (!res.ok) throw new Error(`Parse failed (${res.status})`);
-        const data = await res.json();
+        const res = await fetch("/api/parse-files", { method:"POST", body:form });
+
+        if (!res.ok) {
+          const errData = await res.json().catch(() => ({}));
+          throw new Error((errData as { error?: string }).error || `Server error (${res.status})`);
+        }
+
+        const data = await res.json() as {
+          success: boolean; content?: string; sheets?: string[];
+          rowCount?: number; truncated?: boolean; error?: string;
+        };
+
+        if (!data.success) throw new Error(data.error || "Parse failed");
+
+        // Truncate before Firestore if content is too large
+        let storedContent = data.content || "";
+        const wasTruncated = storedContent.length > MAX_CONTENT_CHARS;
+        if (wasTruncated) {
+          storedContent = storedContent.slice(0, MAX_CONTENT_CHARS) +
+            "\n\n[Content truncated for storage. Full data indexed for AI semantic search.]";
+        }
 
         await updateFileRecord(user.uid, activeFolderId, fileId, {
-          parsedContent: data.content || "",
-          sheets:        data.sheets  || [],
+          parsedContent: storedContent,
+          sheets:        data.sheets   || [],
           rowCount:      data.rowCount || 0,
           status:        "ready",
         });
 
-        // ── Trigger RAG embedding (background, non-blocking) ──
+        // Embed the FULL content (before truncation) for RAG
         if (data.content) {
           setEmbeddingStatus(prev => ({ ...prev, [fileId]: "embedding" }));
           triggerEmbedding(user.uid, fileId, activeFolderId, file.name, data.content);
-          // Mark as embedded after short delay (actual status checked server-side)
-          setTimeout(() => {
-            setEmbeddingStatus(prev => ({ ...prev, [fileId]: "ready" }));
-          }, 3000);
+          setTimeout(() => setEmbeddingStatus(prev => ({ ...prev, [fileId]: "ready" })), 4000);
         }
 
       } catch (err: unknown) {
-        if (fileId) await updateFileRecord(user.uid, activeFolderId, fileId, { status:"error" });
-        setErrorMsg(`Failed to parse "${file.name}": ${err instanceof Error ? err.message : "Unknown error"}`);
+        if (fileId) await updateFileRecord(user.uid, activeFolderId, fileId, { status:"error" }).catch(()=>{});
+        const msg = err instanceof Error ? err.message : "Unknown error";
+        setErrorMsg(prev => prev ? `${prev}\n"${file.name}": ${msg}` : `Failed to parse "${file.name}": ${msg}`);
       }
     }
 
     const updated = await getFolderFiles(user.uid, activeFolderId);
-    setFiles(updated); setUploading(false);
+    setFiles(updated);
+    setUploading(false);
+    setUploadProgress(null);
     if (fileInputRef.current) fileInputRef.current.value = "";
   }
 
@@ -146,10 +215,7 @@ export default function FilesPage() {
   async function handleAnalyzeAll() {
     if (!user || !activeFolderId) return;
     const ready = files.filter(f => f.status === "ready");
-    if (ready.length === 0) {
-      setErrorMsg("No ready files to analyze. Wait for uploads to finish.");
-      return;
-    }
+    if (ready.length === 0) { setErrorMsg("No ready files to analyze."); return; }
     setAnalyzing(true); setAnalysis(null); setDashReady(false); setErrorMsg("");
 
     try {
@@ -158,39 +224,32 @@ export default function FilesPage() {
         headers: { "Content-Type":"application/json" },
         body: JSON.stringify({
           files: ready.map(f => ({
-            fileName: f.name,
-            fileType: f.type,
+            fileName: f.name, fileType: f.type,
             content:  (f.parsedContent || "").slice(0, 8000),
             sheets:   f.sheets || [],
           })),
           businessType: profile?.bizType || "retail",
           bizName:      activeFolder?.bizName || profile?.bizName || "My Business",
-          mode,
-          goals:        profile?.goals || [],
+          mode, goals: profile?.goals || [],
         }),
       });
-
       if (!res.ok) {
         const errData = await res.json().catch(() => ({}));
         throw new Error((errData as { error?: string }).error || `Server error (${res.status})`);
       }
-
-      const data = await res.json() as { success: boolean; analysis?: string; dashboardData?: unknown; error?: string };
+      const data = await res.json() as { success:boolean; analysis?:string; dashboardData?:unknown; error?:string };
       if (!data.success) throw new Error(data.error || "Analysis failed");
 
       setAnalysis(data.analysis || "");
       setDashReady(!!data.dashboardData);
 
-      if ((data.dashboardData as { summary?: string })?.summary) {
-        await saveFolderAnalysis(user.uid, activeFolderId, ((data.dashboardData as { summary: string }).summary).slice(0, 300));
-      }
+      const summary = (data.dashboardData as { summary?:string })?.summary;
+      if (summary) await saveFolderAnalysis(user.uid, activeFolderId, summary.slice(0,300));
 
       try {
         sessionStorage.setItem("dashwise-analysis", JSON.stringify({
-          dashboardData: data.dashboardData,
-          narrative:     data.analysis,
-          bizName:       activeFolder?.bizName || profile?.bizName,
-          mode,
+          dashboardData: data.dashboardData, narrative: data.analysis,
+          bizName: activeFolder?.bizName || profile?.bizName, mode,
         }));
       } catch {}
 
@@ -223,7 +282,7 @@ export default function FilesPage() {
     <div style={{ minHeight:"100vh", background:C.bg, display:"flex", flexDirection:"column" }}>
       <Nav/>
 
-      {/* ── Mobile folder tab bar ── */}
+      {/* Folder tab bar */}
       <div style={{ display:"flex", alignItems:"center", gap:8, padding:"10px 16px", background:C.surface, borderBottom:`1px solid ${C.border}`, overflowX:"auto" }}>
         <button onClick={()=>setShowNewFolder(!showNewFolder)} style={{ background:C.blueBg, border:`1px solid ${C.blueMid}`, color:C.blue, fontSize:12, fontWeight:600, padding:"7px 12px", borderRadius:radius.sm, cursor:"pointer", flexShrink:0 }}>
           + New
@@ -242,12 +301,11 @@ export default function FilesPage() {
         ))}
       </div>
 
-      {/* New folder input */}
       {showNewFolder && (
         <div style={{ background:C.surface, borderBottom:`1px solid ${C.border}`, padding:"10px 16px", display:"flex", gap:8 }}>
           <input autoFocus value={newFolderName} onChange={e=>setNewFolderName(e.target.value)}
             onKeyDown={e=>{ if(e.key==="Enter")handleCreateFolder(); if(e.key==="Escape")setShowNewFolder(false); }}
-            placeholder="Folder name (e.g. Q1 2025)..."
+            placeholder="Folder name..."
             style={{ flex:1, background:C.bg, border:`1px solid ${C.border}`, borderRadius:radius.sm, padding:"9px 12px", fontSize:14, color:C.text, outline:"none" }}/>
           <button onClick={handleCreateFolder} disabled={!newFolderName.trim()||creatingFolder}
             style={{ ...btnPrimary, padding:"9px 16px", borderRadius:radius.sm, fontSize:13, opacity:(!newFolderName.trim()||creatingFolder)?.5:1 }}>
@@ -257,7 +315,6 @@ export default function FilesPage() {
         </div>
       )}
 
-      {/* ── Main content ── */}
       <div style={{ flex:1, overflowY:"auto", padding:"20px 16px" }}>
         <div style={{ maxWidth:760, margin:"0 auto" }}>
 
@@ -265,26 +322,35 @@ export default function FilesPage() {
             <div style={{ textAlign:"center", padding:"60px 20px" }}>
               <div style={{ fontSize:48, marginBottom:16 }}>📂</div>
               <h2 style={{ fontSize:20, fontWeight:700, color:C.text, marginBottom:8 }}>Create a folder to start</h2>
-              <p style={{ fontSize:14, color:C.text3, marginBottom:20 }}>Click <strong>+ New</strong> above to create your first folder.</p>
+              <p style={{ fontSize:14, color:C.text3 }}>Click <strong>+ New</strong> above to create your first folder.</p>
             </div>
           ) : (
             <>
-              {/* Folder header */}
               <div style={{ marginBottom:18 }}>
                 <h1 style={{ fontSize:22, fontWeight:700, letterSpacing:"-0.4px", color:C.text, marginBottom:3 }}>{activeFolder?.bizName}</h1>
                 <p style={{ fontSize:13, color:C.text3 }}>
                   {files.length} file{files.length!==1?"s":""} · {readyFiles.length} ready to analyze
-                  {process.env.NEXT_PUBLIC_OPENAI_ENABLED === "true" && readyFiles.length > 0 && (
-                    <span style={{ marginLeft:8, color:"#34c759", fontWeight:500 }}>· RAG enabled ✓</span>
-                  )}
                 </p>
+              </div>
+
+              {/* Limit info bar */}
+              <div style={{ background:C.blueBg, border:`1px solid ${C.blueMid}`, borderRadius:radius.sm, padding:"10px 14px", marginBottom:14, fontSize:12, color:C.blue }}>
+                📎 Max <strong>{MAX_FILE_MB}MB per file</strong> · <strong>{MAX_FILES_PER_SESS} files per upload</strong> · <strong>{MAX_TOTAL_MB}MB per session</strong> · CSV, Excel, PDF, TXT, JSON supported
               </div>
 
               {/* Error */}
               {errorMsg && (
-                <div style={{ background:C.redBg, border:`1px solid #ffd6d6`, color:C.red, fontSize:13, padding:"12px 14px", borderRadius:radius.sm, marginBottom:16, display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
-                  <span style={{ lineHeight:1.5 }}>⚠ {errorMsg}</span>
+                <div style={{ background:C.redBg, border:`1px solid #ffd6d6`, color:C.red, fontSize:13, padding:"12px 14px", borderRadius:radius.sm, marginBottom:12, display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+                  <span style={{ lineHeight:1.6, whiteSpace:"pre-line" }}>⚠ {errorMsg}</span>
                   <button onClick={()=>setErrorMsg("")} style={{ background:"none", border:"none", color:C.red, cursor:"pointer", fontSize:18, flexShrink:0 }}>×</button>
+                </div>
+              )}
+
+              {/* Warning */}
+              {warnMsg && (
+                <div style={{ background:"#fff8e8", border:"1px solid #ffe4a0", color:"#996600", fontSize:13, padding:"10px 14px", borderRadius:radius.sm, marginBottom:12, display:"flex", justifyContent:"space-between", alignItems:"flex-start", gap:10 }}>
+                  <span style={{ lineHeight:1.6 }}>⚠ {warnMsg}</span>
+                  <button onClick={()=>setWarnMsg("")} style={{ background:"none", border:"none", color:"#996600", cursor:"pointer", fontSize:18, flexShrink:0 }}>×</button>
                 </div>
               )}
 
@@ -297,14 +363,18 @@ export default function FilesPage() {
               >
                 <input ref={fileInputRef} type="file" multiple accept=".csv,.xlsx,.xls,.xlsm,.pdf,.txt,.json" onChange={handleUpload} style={{ display:"none" }}/>
                 {uploading ? (
-                  <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12 }}>
-                    <Spinner/><span style={{ fontSize:14, color:C.text2 }}>Uploading and parsing files...</span>
+                  <div style={{ display:"flex", flexDirection:"column", alignItems:"center", gap:10 }}>
+                    <Spinner size={24}/>
+                    <div style={{ fontSize:14, color:C.text2, fontWeight:500 }}>
+                      {uploadProgress ? `Uploading file ${uploadProgress.current} of ${uploadProgress.total}...` : "Uploading..."}
+                    </div>
+                    <div style={{ fontSize:12, color:C.text3 }}>Do not close this page</div>
                   </div>
                 ) : (
                   <>
                     <div style={{ fontSize:28, marginBottom:8 }}>⬆️</div>
                     <div style={{ fontWeight:600, fontSize:14, color:C.text, marginBottom:3 }}>Click to upload files</div>
-                    <div style={{ fontSize:12, color:C.text3 }}>CSV · Excel · PDF · TXT · JSON</div>
+                    <div style={{ fontSize:12, color:C.text3 }}>CSV · Excel · PDF · TXT · JSON · Max {MAX_FILE_MB}MB each</div>
                   </>
                 )}
               </div>
@@ -320,20 +390,17 @@ export default function FilesPage() {
                         <div style={{ fontSize:11, color:C.text3, marginTop:2, display:"flex", gap:8, flexWrap:"wrap" as const }}>
                           <span>{(file.size/1024).toFixed(1)} KB</span>
                           {file.sheets?.length ? <span>{file.sheets.length} sheets</span> : null}
-                          {(file.rowCount||0)>0 ? <span>{file.rowCount} rows</span> : null}
-                          {/* Embedding status indicator */}
-                          {file.id && embeddingStatus[file.id] === "embedding" && (
+                          {(file.rowCount||0)>0 ? <span>{file.rowCount?.toLocaleString()} rows</span> : null}
+                          {file.id && embeddingStatus[file.id]==="embedding" && (
                             <span style={{ color:C.blue, display:"flex", alignItems:"center", gap:3 }}>
-                              <Spinner size={10}/> indexing for AI search...
+                              <Spinner size={10}/> indexing...
                             </span>
                           )}
-                          {file.id && embeddingStatus[file.id] === "ready" && (
+                          {file.id && embeddingStatus[file.id]==="ready" && (
                             <span style={{ color:"#34c759" }}>🔍 AI search ready</span>
                           )}
                         </div>
                       </div>
-
-                      {/* Status */}
                       {file.status==="uploading" ? (
                         <div style={{ display:"flex", alignItems:"center", gap:5, flexShrink:0 }}>
                           <Spinner size={14}/><span style={{ fontSize:11, color:C.text3 }}>Parsing...</span>
@@ -343,11 +410,8 @@ export default function FilesPage() {
                           {file.status==="ready"?"✓ Ready":"Error"}
                         </span>
                       )}
-
-                      {/* Delete */}
                       {file.id && file.status!=="uploading" && (
                         <button onClick={()=>handleDeleteFile(file.id!, file.name)} disabled={deletingId===file.id}
-                          title="Delete file"
                           style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.text3, width:30, height:30, borderRadius:radius.sm, cursor:"pointer", display:"flex", alignItems:"center", justifyContent:"center", fontSize:14, flexShrink:0, opacity:deletingId===file.id?.5:1 }}>
                           {deletingId===file.id?<Spinner size={12}/>:"🗑"}
                         </button>
@@ -372,14 +436,9 @@ export default function FilesPage() {
                       </button>
                     ))}
                   </div>
-
                   <button onClick={handleAnalyzeAll} disabled={analyzing} style={{ ...btnPrimary, width:"100%", padding:"14px", borderRadius:radius.sm, fontSize:15, opacity:analyzing?.6:1 }}>
-                    {analyzing
-                      ? <><Spinner size={16} color="#fff"/> Analyzing {readyFiles.length} file{readyFiles.length!==1?"s":""}...</>
-                      : `🧠 Analyze ${readyFiles.length} file${readyFiles.length!==1?"s":""} →`
-                    }
+                    {analyzing ? <><Spinner size={16} color="#fff"/> Analyzing {readyFiles.length} file{readyFiles.length!==1?"s":""}...</> : `🧠 Analyze ${readyFiles.length} file${readyFiles.length!==1?"s":""} →`}
                   </button>
-
                   {dashReady && (
                     <button onClick={()=>router.push("/dashboard-view")} style={{ ...btnPrimary, width:"100%", marginTop:10, padding:"13px", borderRadius:radius.sm, fontSize:14, background:"transparent", color:C.blue, border:`2px solid ${C.blue}` }}>
                       🚀 Open Full Dashboard
@@ -402,17 +461,12 @@ export default function FilesPage() {
                   </div>
                   <div style={{ padding:"20px 18px" }}>{renderAnalysis(analysis)}</div>
                   <div style={{ padding:"14px 18px", borderTop:`1px solid ${C.border}`, display:"flex", gap:10, flexWrap:"wrap" as const }}>
-                    <Link href="/advisor" style={{ ...btnPrimary, flex:1, minWidth:120, padding:"11px", borderRadius:radius.sm, textAlign:"center" as const, fontSize:13 }}>
-                      💬 Ask Advisor
-                    </Link>
-                    <button onClick={handleAnalyzeAll} style={{ padding:"11px 16px", borderRadius:radius.sm, background:C.bg, border:`1px solid ${C.border}`, color:C.text2, fontSize:13, cursor:"pointer", flexShrink:0 }}>
-                      ↻ Re-analyze
-                    </button>
+                    <Link href="/advisor" style={{ ...btnPrimary, flex:1, minWidth:120, padding:"11px", borderRadius:radius.sm, textAlign:"center" as const, fontSize:13 }}>💬 Ask Advisor</Link>
+                    <button onClick={handleAnalyzeAll} style={{ padding:"11px 16px", borderRadius:radius.sm, background:C.bg, border:`1px solid ${C.border}`, color:C.text2, fontSize:13, cursor:"pointer", flexShrink:0 }}>↻ Re-analyze</button>
                   </div>
                 </div>
               )}
 
-              {/* Empty state */}
               {files.length===0 && !uploading && (
                 <div style={{ textAlign:"center", padding:"40px 20px", color:C.text3 }}>
                   <div style={{ fontSize:36, marginBottom:10 }}>📄</div>

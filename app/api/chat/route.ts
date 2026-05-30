@@ -1,16 +1,9 @@
 // app/api/chat/route.ts
-// HYBRID: OpenAI embeddings for RAG retrieval + Claude Sonnet for answers.
-//
-// Flow:
-//   1. User sends message
-//   2. OpenAI embeds the question (cheap — $0.000001)
-//   3. Firestore semantic search finds top 8 relevant chunks
-//   4. Claude Sonnet answers using only those chunks as context
-//   5. Falls back to full context stuffing if no embeddings exist yet
+// HYBRID: OpenAI embeddings for RAG + Claude Sonnet for answers.
+// Lazily imports vector store to avoid Firebase init at build time.
 
 import { NextRequest, NextResponse } from "next/server";
 import Anthropic from "@anthropic-ai/sdk";
-import { semanticSearch, buildContextFromResults } from "@/lib/rag/vectorStore";
 
 const claude = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
 export const runtime = "nodejs";
@@ -31,29 +24,24 @@ type BusinessData = {
   folderSummaries: FolderSummary[];
 };
 
-// Smart fallback: score folders by relevance to question
-function scoredFallback(businessData: BusinessData, question: string): string {
+function scoredFallback(bd: BusinessData, question: string): string {
   const q       = question.toLowerCase();
-  const folders = businessData.folderSummaries.filter(f => f.readyCount > 0);
-
-  const scored = folders.map(f => {
-    const haystack = `${f.folderName} ${f.fileNames.join(" ")} ${f.lastAnalysis}`.toLowerCase();
-    const score    = q.split(/\s+/).filter(w => w.length > 3).reduce((s, w) => s + (haystack.includes(w) ? 1 : 0), 0);
+  const folders = bd.folderSummaries.filter(f => f.readyCount > 0);
+  const scored  = folders.map(f => {
+    const hay   = `${f.folderName} ${f.fileNames.join(" ")} ${f.lastAnalysis}`.toLowerCase();
+    const score = q.split(/\s+/).filter(w => w.length > 3).reduce((s, w) => s + (hay.includes(w) ? 1 : 0), 0);
     return { folder: f, score };
   }).sort((a, b) => b.score - a.score);
 
-  let context   = "";
-  let usedChars = 0;
-  const MAX     = 100_000;
-
+  let ctx = "", used = 0;
+  const MAX = 100_000;
   for (const { folder } of scored) {
-    if (usedChars >= MAX) break;
-    const content = folder.parsedContent.slice(0, Math.min(MAX - usedChars, 40_000));
-    context += `\n\n╔══ FOLDER: ${folder.folderName} ══\n║ Files: ${folder.fileNames.join(", ")}\n${folder.lastAnalysis ? `║ Last analysis: ${folder.lastAnalysis}\n` : ""}╚══\n\n${content}`;
-    usedChars += content.length;
+    if (used >= MAX) break;
+    const slice = folder.parsedContent.slice(0, Math.min(MAX - used, 40_000));
+    ctx  += `\n\n╔══ FOLDER: ${folder.folderName} ══\n║ Files: ${folder.fileNames.join(", ")}\n${folder.lastAnalysis ? `║ Last analysis: ${folder.lastAnalysis}\n` : ""}╚══\n\n${slice}`;
+    used += slice.length;
   }
-
-  return context;
+  return ctx;
 }
 
 export async function POST(req: NextRequest) {
@@ -61,36 +49,32 @@ export async function POST(req: NextRequest) {
     const { message, profile, businessData, chatHistory } = await req.json();
     if (!message) return NextResponse.json({ error: "No message" }, { status: 400 });
 
-    const uid     = profile?.uid        || "";
-    const bizName = profile?.bizName    || "this business";
-    const bizType = profile?.bizType    || "small business";
-    const goals   = profile?.goals      || [];
+    const uid     = profile?.uid         || "";
+    const bizName = profile?.bizName     || "this business";
+    const bizType = profile?.bizType     || "small business";
+    const goals   = profile?.goals       || [];
     const tone    = profile?.advisorTone || "balanced";
-    const name    = profile?.name       || "there";
+    const name    = profile?.name        || "there";
 
-    const bizLabels: Record<string, string> = {
-      retail:     "retail store",
-      restaurant: "restaurant",
-      ecommerce:  "ecommerce store",
-      service:    "service business",
-      clinic:     "clinic",
-      salon:      "salon",
+    const bizLabels: Record<string,string> = {
+      retail:"retail store", restaurant:"restaurant", ecommerce:"ecommerce store",
+      service:"service business", clinic:"clinic", salon:"salon",
     };
-
-    const toneMap: Record<string, string> = {
+    const toneMap: Record<string,string> = {
       direct:   "Be direct. Lead with the key number or action. No pleasantries.",
       balanced: "Balance insight with encouragement. Be specific but approachable.",
-      coaching: "End with one guiding question to help the user think through next steps.",
+      coaching: "End with one guiding question to help the user think.",
     };
 
-    // ── Step 1: Try RAG retrieval ──────────────────────────
-    let context      = "";
-    let ragUsed      = false;
-    let sourceCount  = 0;
-    let strategy     = "none";
+    // ── Try RAG (lazy import avoids Firebase build-time init) ─
+    let context     = "";
+    let ragUsed     = false;
+    let sourceCount = 0;
+    let strategy    = "none";
 
     if (uid && process.env.OPENAI_API_KEY) {
       try {
+        const { semanticSearch, buildContextFromResults } = await import("@/lib/rag/vectorStore");
         const results = await semanticSearch(uid, message, 8, 0.25);
         if (results.length > 0) {
           context     = buildContextFromResults(results);
@@ -103,7 +87,7 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // ── Step 2: Fallback to smart context stuffing ─────────
+    // ── Fallback: smart context stuffing ─────────────────────
     if (!ragUsed) {
       const bd = businessData as BusinessData | null;
       if (bd && bd.folderCount > 0) {
@@ -112,7 +96,6 @@ export async function POST(req: NextRequest) {
       }
     }
 
-    // ── Step 3: Build system prompt ────────────────────────
     const folderCount = (businessData as BusinessData)?.folderCount || 0;
     const fileCount   = (businessData as BusinessData)?.fileCount   || 0;
 
@@ -131,13 +114,12 @@ ${context || "No data uploaded yet. Ask the user to upload files or connect thei
 
 RULES:
 - Reference specific file names, folder names, and exact numbers from the data
-- Identify patterns across multiple folders when relevant
+- Identify patterns across multiple folders when relevant  
 - Use **bold** for key numbers and action items
 - 2-4 paragraphs maximum
-- If data is missing for the question, say exactly what file would help
+- If data is missing, say exactly what file would help
 - Never invent or estimate numbers — only cite figures from the data above`;
 
-    // ── Step 4: Claude Sonnet generates the answer ─────────
     const response = await claude.messages.create({
       model:      "claude-sonnet-4-6",
       max_tokens: 1200,
@@ -155,11 +137,7 @@ RULES:
       ? response.content[0].text
       : "I had trouble responding. Please try again.";
 
-    return NextResponse.json({
-      success: true,
-      reply,
-      meta: { strategy, ragUsed, sourceCount },
-    });
+    return NextResponse.json({ success: true, reply, meta: { strategy, ragUsed, sourceCount } });
 
   } catch (err: unknown) {
     console.error("[chat]", err);

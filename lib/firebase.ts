@@ -1,6 +1,6 @@
 // lib/firebase.ts
-import { initializeApp, getApps } from "firebase/app";
-import { getAuth, connectAuthEmulator } from "firebase/auth";
+import { initializeApp, getApps, getApp } from "firebase/app";
+import { getAuth } from "firebase/auth";
 import { getFirestore, enableNetwork } from "firebase/firestore";
 
 const firebaseConfig = {
@@ -12,12 +12,18 @@ const firebaseConfig = {
   appId:             process.env.NEXT_PUBLIC_FIREBASE_APP_ID,
 };
 
-const app = getApps().length === 0 ? initializeApp(firebaseConfig) : getApps()[0];
+// Only initialize if config is present (prevents build-time errors)
+const hasConfig = !!firebaseConfig.apiKey && !!firebaseConfig.projectId;
+
+const app = hasConfig
+  ? (getApps().length === 0 ? initializeApp(firebaseConfig) : getApp())
+  : (getApps().length === 0 ? initializeApp({ apiKey:"placeholder", projectId:"placeholder", appId:"placeholder" }) : getApp());
+
 export const auth = getAuth(app);
 export const db   = getFirestore(app);
 
-// Keep Firestore online
-if (typeof window !== "undefined") {
+// Enable network only in browser
+if (typeof window !== "undefined" && hasConfig) {
   enableNetwork(db).catch(() => {});
 }
 
