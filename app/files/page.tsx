@@ -148,9 +148,28 @@ export default function FilesPage() {
           status: "uploading",
         });
 
-        const form = new FormData();
-        form.append("file", file);
-        const res = await fetch("/api/parse-files", { method:"POST", body:form });
+        // Files > 3MB sent as base64 JSON to bypass formData body limit
+        // Files <= 3MB sent as formData (faster)
+        const FORM_LIMIT = 3 * 1024 * 1024;
+        let res: Response;
+
+        if (file.size <= FORM_LIMIT) {
+          const form = new FormData();
+          form.append("file", file);
+          res = await fetch("/api/parse-files", { method:"POST", body:form });
+        } else {
+          // Convert to base64 and send as JSON
+          const ab     = await file.arrayBuffer();
+          const bytes  = new Uint8Array(ab);
+          let binary   = "";
+          for (let b = 0; b < bytes.byteLength; b++) binary += String.fromCharCode(bytes[b]);
+          const base64 = btoa(binary);
+          res = await fetch("/api/parse-files", {
+            method:  "POST",
+            headers: { "Content-Type": "application/json" },
+            body:    JSON.stringify({ fileName: file.name, base64 }),
+          });
+        }
 
         if (!res.ok) {
           const errData = await res.json().catch(() => ({}));

@@ -6,8 +6,6 @@ const nextConfig: NextConfig = {
       bodySizeLimit: "50mb",
     },
   },
-  // Prevent build-time prerendering of API routes
-  output: "standalone",
 };
 
 export default nextConfig;
