@@ -1,6 +1,6 @@
 // app/api/parse-files/route.ts
-// Parses uploaded files. Accepts both formData and base64 JSON body.
-// Client sends small files as formData, large files as base64 JSON chunks.
+// Streams the file directly from the request body.
+// No formData parsing — reads raw bytes to avoid all size limits.
 
 import { NextRequest, NextResponse } from "next/server";
 import * as XLSX from "xlsx";
@@ -8,32 +8,29 @@ import * as XLSX from "xlsx";
 export const runtime     = "nodejs";
 export const maxDuration = 60;
 export const dynamic     = "force-dynamic";
+export const preferredRegion = "auto";
 
-async function parseBuffer(buffer: Buffer, fileName: string): Promise<{
-  content: string; sheets: string[]; rowCount: number; fileType: string;
-}> {
+async function parseBuffer(buffer: Buffer, fileName: string) {
   const fileType = fileName.split(".").pop()?.toLowerCase() || "";
-  let content  = "";
-  let sheets:  string[] = [];
-  let rowCount = 0;
+  let content = "", sheets: string[] = [], rowCount = 0;
 
   if (fileType === "csv") {
     content  = buffer.toString("utf-8");
     rowCount = content.split("\n").filter(l => l.trim()).length - 1;
   }
 
-  else if (["xlsx", "xls", "xlsm", "xlsb"].includes(fileType)) {
-    const wb = XLSX.read(buffer, { type: "buffer", cellDates: true });
+  else if (["xlsx","xls","xlsm","xlsb"].includes(fileType)) {
+    const wb = XLSX.read(buffer, { type:"buffer", cellDates:true });
     sheets   = wb.SheetNames;
     const parts: string[] = [];
     for (const sheetName of wb.SheetNames) {
       const ws  = wb.Sheets[sheetName];
-      const aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { header: 1, defval: "" });
+      const aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { header:1, defval:"" });
       if (aoa.length <= 1) continue;
       rowCount += aoa.length - 1;
       const lines = aoa.map(row =>
         (row as unknown[]).map(cell => {
-          if (cell === null || cell === undefined) return "";
+          if (cell == null) return "";
           if (cell instanceof Date) return cell.toISOString().split("T")[0];
           return String(cell).replace(/,/g, ";");
         }).join(",")
@@ -48,13 +45,12 @@ async function parseBuffer(buffer: Buffer, fileName: string): Promise<{
       // eslint-disable-next-line @typescript-eslint/no-require-imports
       const pdfParse = require("pdf-parse/lib/pdf-parse.js");
       const result   = await pdfParse(buffer);
-      content        = result.text || "";
-      rowCount       = content.split("\n").filter(l => l.trim()).length;
-    } catch {
-      content  = buffer.toString("latin1").replace(/[^\x20-\x7E\n\t]/g, " ").replace(/\s{3,}/g, " ").trim();
+      content  = result.text || "";
       rowCount = content.split("\n").filter(l => l.trim()).length;
-      if (!content || content.length < 50)
-        throw new Error("Could not read this PDF. Make sure it is text-based, not a scanned image.");
+    } catch {
+      content  = buffer.toString("latin1").replace(/[^\x20-\x7E\n\t]/g," ").replace(/\s{3,}/g," ").trim();
+      rowCount = content.split("\n").filter(l => l.trim()).length;
+      if (content.length < 50) throw new Error("Could not read this PDF. Make sure it is text-based, not a scanned image.");
     }
   }
 
@@ -73,30 +69,23 @@ async function parseBuffer(buffer: Buffer, fileName: string): Promise<{
     throw new Error(`".${fileType}" is not supported. Use CSV, Excel, PDF, TXT, or JSON.`);
   }
 
-  content = content.replace(/\r\n/g, "\n").replace(/\r/g, "\n").replace(/\n{4,}/g, "\n\n\n").trim();
+  content = content.replace(/\r\n/g,"\n").replace(/\r/g,"\n").replace(/\n{4,}/g,"\n\n\n").trim();
   return { content, sheets, rowCount, fileType };
 }
 
 export async function POST(req: NextRequest) {
   try {
-    const contentType = req.headers.get("content-type") || "";
-    let buffer: Buffer;
-    let fileName: string;
+    // Read fileName from header (client sends it there)
+    // Decode filename from header (client encodes it to handle special chars)
+    const rawName  = req.headers.get("x-file-name") || "upload.csv";
+    const fileName = decodeURIComponent(rawName);
 
-    // ── Path A: JSON with base64 (for larger files) ────────
-    if (contentType.includes("application/json")) {
-      const body = await req.json() as { fileName: string; base64: string };
-      fileName = body.fileName;
-      buffer   = Buffer.from(body.base64, "base64");
-    }
+    // Stream the raw body directly — no formData, no JSON wrapper
+    const arrayBuf = await req.arrayBuffer();
+    const buffer   = Buffer.from(arrayBuf);
 
-    // ── Path B: FormData (for small files) ────────────────
-    else {
-      const formData = await req.formData();
-      const file     = formData.get("file") as File | null;
-      if (!file) return NextResponse.json({ error: "No file provided" }, { status: 400 });
-      fileName = file.name;
-      buffer   = Buffer.from(await file.arrayBuffer());
+    if (buffer.length === 0) {
+      return NextResponse.json({ error: "Empty file received." }, { status: 400 });
     }
 
     const { content, sheets, rowCount, fileType } = await parseBuffer(buffer, fileName);
@@ -109,7 +98,8 @@ export async function POST(req: NextRequest) {
     const truncated = content.length > MAX_CHARS;
 
     return NextResponse.json({
-      success: true, content, sheets, rowCount, fileType, fileName,
+      success: true, content, sheets, rowCount,
+      fileType, fileName,
       size: buffer.length, chars: content.length, truncated,
     });
 

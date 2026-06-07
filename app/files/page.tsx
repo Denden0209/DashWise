@@ -148,40 +148,9 @@ export default function FilesPage() {
           status: "uploading",
         });
 
-        // Files > 3MB sent as base64 JSON to bypass formData body limit
-        // Files <= 3MB sent as formData (faster)
-        const FORM_LIMIT = 3 * 1024 * 1024;
-        let res: Response;
-
-        if (file.size <= FORM_LIMIT) {
-          const form = new FormData();
-          form.append("file", file);
-          res = await fetch("/api/parse-files", { method:"POST", body:form });
-        } else {
-          // Convert to base64 and send as JSON
-          const ab     = await file.arrayBuffer();
-          const bytes  = new Uint8Array(ab);
-          let binary   = "";
-          for (let b = 0; b < bytes.byteLength; b++) binary += String.fromCharCode(bytes[b]);
-          const base64 = btoa(binary);
-          res = await fetch("/api/parse-files", {
-            method:  "POST",
-            headers: { "Content-Type": "application/json" },
-            body:    JSON.stringify({ fileName: file.name, base64 }),
-          });
-        }
-
-        if (!res.ok) {
-          const errData = await res.json().catch(() => ({}));
-          throw new Error((errData as { error?: string }).error || `Server error (${res.status})`);
-        }
-
-        const data = await res.json() as {
-          success: boolean; content?: string; sheets?: string[];
-          rowCount?: number; truncated?: boolean; error?: string;
-        };
-
-        if (!data.success) throw new Error(data.error || "Parse failed");
+        // Parse file entirely in the browser — no server request, no size limit
+        const { parseFileInBrowser } = await import("@/lib/parseFileClient");
+        const data = await parseFileInBrowser(file);
 
         // Truncate before Firestore if content is too large
         let storedContent = data.content || "";
