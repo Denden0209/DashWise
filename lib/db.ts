@@ -46,6 +46,7 @@ export type BusinessFolder = {
   fileCount:            number;
   lastAnalyzedAt?:      unknown;
   lastAnalysisSummary?: string;
+  lastAnalysisFull?:    string;
   createdAt?:           unknown;
 };
 
@@ -69,6 +70,14 @@ export type ChatMessage = {
   content:    string;
   type?:      string;
   timestamp?: unknown;
+};
+
+export type FullAnalysis = {
+  analysis:      string;
+  dashboardData: unknown;
+  mode:          string;
+  fileNames:     string[];
+  analyzedAt?:   string;
 };
 
 // ── Profile ────────────────────────────────────────────────
@@ -112,6 +121,25 @@ export async function saveFolderAnalysis(uid: string, folderId: string, summary:
     lastAnalysisSummary: summary,
     lastAnalyzedAt:      serverTimestamp(),
   });
+}
+
+// Save complete analysis (dashboard JSON + narrative) so it survives navigation
+export async function saveFolderFullAnalysis(uid: string, folderId: string, data: FullAnalysis): Promise<void> {
+  const summary = (data.dashboardData as { summary?: string })?.summary || "";
+  await updateDoc(doc(db, "users", uid, "folders", folderId), {
+    lastAnalysisFull:    JSON.stringify({ ...data, analyzedAt: new Date().toISOString() }),
+    lastAnalysisSummary: summary.slice(0, 300),
+    lastAnalyzedAt:      serverTimestamp(),
+  });
+}
+
+// Load last full analysis for a folder (returns null if never analyzed)
+export async function getFolderFullAnalysis(uid: string, folderId: string): Promise<FullAnalysis | null> {
+  const snap = await getDoc(doc(db, "users", uid, "folders", folderId));
+  if (!snap.exists()) return null;
+  const raw = snap.data().lastAnalysisFull;
+  if (!raw) return null;
+  try { return JSON.parse(raw) as FullAnalysis; } catch { return null; }
 }
 
 // ── Files ──────────────────────────────────────────────────
@@ -163,14 +191,11 @@ export async function getRecentChats(uid: string, n = 30): Promise<ChatMessage[]
   return snap.docs.map(d => ({ id: d.id, ...d.data() } as ChatMessage));
 }
 
-// ── Full business data ─────────────────────────────────────
-// Returns ALL folders and ALL files with COMPLETE parsed content.
-// Used by the advisor to understand the entire business.
-// No character truncation — the chat API handles context management.
+// ── Full business data (all folders, full content) ────────
 export async function getAllBusinessData(uid: string): Promise<{
   folderCount:     number;
   fileCount:       number;
-  totalDataSize:   number;  // total characters across all files
+  totalDataSize:   number;
   folderSummaries: {
     folderId:      string;
     folderName:    string;
@@ -178,7 +203,7 @@ export async function getAllBusinessData(uid: string): Promise<{
     fileTypes:     string[];
     fileCount:     number;
     readyCount:    number;
-    parsedContent: string;  // FULL content — no truncation
+    parsedContent: string;
     lastAnalysis:  string;
   }[];
 }> {
@@ -187,11 +212,9 @@ export async function getAllBusinessData(uid: string): Promise<{
   let   totalSize = 0;
 
   for (const folder of folders) {
-    const files     = await getFolderFiles(uid, folder.id!);
-    const ready     = files.filter(f => f.status === "ready" && f.parsedContent);
+    const files = await getFolderFiles(uid, folder.id!);
+    const ready = files.filter(f => f.status === "ready" && f.parsedContent);
 
-    // Build FULL content for all ready files in this folder
-    // Each file gets a clear header so Claude knows which file each section came from
     const combined = ready.map(f => {
       const content = f.parsedContent || "";
       totalSize    += content.length;
