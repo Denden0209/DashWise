@@ -62,6 +62,8 @@ export type FolderFile = {
   rowCount?:      number;
   status:         string;
   uploadedAt?:    unknown;
+  hasCube?:       boolean;   // true = interactive dashboard data available
+  cubeChunks?:    number;    // number of chunk docs in the cube subcollection
 };
 
 export type ChatMessage = {
@@ -159,6 +161,35 @@ export async function getFolderFiles(uid: string, folderId: string): Promise<Fol
 
 export async function updateFileRecord(uid: string, folderId: string, fileId: string, data: Partial<FolderFile>): Promise<void> {
   await updateDoc(doc(db, "users", uid, "folders", folderId, "files", fileId), data);
+}
+
+// ── Data cubes (interactive dashboard) ─────────────────────
+// The cube JSON can exceed Firestore's 1MB doc limit, so it is stringified
+// and split into ~700KB chunk documents under files/{fileId}/cube/{idx}.
+const CUBE_CHUNK_CHARS = 700_000;
+
+export async function saveFileCube(uid: string, folderId: string, fileId: string, cube: unknown): Promise<void> {
+  const json   = JSON.stringify(cube);
+  const chunks: string[] = [];
+  for (let i = 0; i < json.length; i += CUBE_CHUNK_CHARS) {
+    chunks.push(json.slice(i, i + CUBE_CHUNK_CHARS));
+  }
+  await Promise.all(chunks.map((data, idx) =>
+    setDoc(doc(db, "users", uid, "folders", folderId, "files", fileId, "cube", String(idx)), { idx, data })
+  ));
+  await updateDoc(doc(db, "users", uid, "folders", folderId, "files", fileId), {
+    hasCube: true, cubeChunks: chunks.length,
+  });
+}
+
+export async function getFileCube<T = unknown>(uid: string, folderId: string, fileId: string): Promise<T | null> {
+  const snap = await getDocs(collection(db, "users", uid, "folders", folderId, "files", fileId, "cube"));
+  if (snap.empty) return null;
+  const parts = snap.docs
+    .map(d => d.data() as { idx: number; data: string })
+    .sort((a, b) => a.idx - b.idx)
+    .map(p => p.data);
+  try { return JSON.parse(parts.join("")) as T; } catch { return null; }
 }
 
 // ── Uploads (legacy) ───────────────────────────────────────

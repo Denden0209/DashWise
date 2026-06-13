@@ -9,6 +9,7 @@ import {
   getUserFolders, createFolder, getFolderFiles,
   addFileToFolder, updateFileRecord,
   saveFolderFullAnalysis, getFolderFullAnalysis,
+  saveFileCube,
   BusinessFolder, FolderFile,
 } from "@/lib/db";
 import Nav from "@/components/Nav";
@@ -151,6 +152,15 @@ export default function FilesPage() {
           status:        "ready",
         });
 
+        // Save the interactive-dashboard cube (tabular files with a date column)
+        if (data.cube) {
+          try {
+            await saveFileCube(user.uid, activeFolderId, fileId, data.cube);
+          } catch (cubeErr) {
+            console.warn("[cube] save failed (dashboard falls back to static):", cubeErr);
+          }
+        }
+
         if (data.content) {
           setEmbeddingStatus(prev => ({ ...prev, [fileId]: "embedding" }));
           triggerEmbedding(user.uid, fileId, activeFolderId, file.name, data.content);
@@ -234,9 +244,13 @@ export default function FilesPage() {
         bizName:       activeFolder?.bizName || profile?.bizName || "My Business",
         mode,
         analyzedAt,
+        folderId:      activeFolderId,
+        cubeFiles:     files
+          .filter(f => f.status === "ready" && f.hasCube && f.id)
+          .map(f => ({ id: f.id!, name: f.name })),
       }));
     } catch {}
-    window.open("/dashboard-view", "dashwise-dashboard", "width=1240,height=860,menubar=no,toolbar=no,location=no,status=no");
+    window.open("/dashboard-view", "dashwise-dashboard", "width=1280,height=880,menubar=no,toolbar=no,location=no,status=no");
   }
 
   const activeFolder = folders.find(f => f.id === activeFolderId);
@@ -373,6 +387,7 @@ export default function FilesPage() {
                             <span style={{ color:C.blue, display:"flex", alignItems:"center", gap:3 }}><Spinner size={10}/> indexing...</span>
                           )}
                           {file.id && embeddingStatus[file.id]==="ready" && <span style={{ color:"#34c759" }}>🔍 AI search ready</span>}
+                          {file.hasCube && <span style={{ color:C.purple, fontWeight:500 }}>📊 Interactive</span>}
                         </div>
                       </div>
                       {file.status==="uploading" ? (

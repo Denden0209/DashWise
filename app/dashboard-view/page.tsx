@@ -1,90 +1,203 @@
 "use client";
-// Full visual dashboard — opened in a NEW WINDOW from the Files page.
-// Reads analysis from sessionStorage (written by Files page before window.open).
+// Interactive dashboard — opened in a NEW WINDOW from the Files page.
+// Three tabs:
+//   📊 Explore   — dynamic: filter sidebar, time intelligence, YoY, Agent (needs a data cube)
+//   🤖 AI Report — Claude's static analysis (kpis/charts JSON)
+//   📝 Narrative — full markdown report
+// The Explore tab computes EVERY number locally from the cube — nothing is AI-generated.
 
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState, useCallback } from "react";
+import { onAuthStateChanged, User } from "firebase/auth";
+import { auth } from "@/lib/firebase";
+import { getFileCube } from "@/lib/db";
+import {
+  DataCube, Filters, DateWindow, Grain, MeasureSpec,
+  filterRows, computeMeasure, seriesByGrain, byDimension,
+  yoyOverlay, periodComparison, timeCapabilities, presetWindow,
+  formatMeasureValue,
+} from "@/lib/dataCube";
 
 const C = {
   bg:"#f5f5f7", surface:"#ffffff", border:"#e5e5ea", blue:"#0071e3",
   blueBg:"#e8f0fe", text:"#1d1d1f", text2:"#515154", text3:"#86868b",
-  green:"#34c759", red:"#ff3b30", amber:"#ff9f0a",
+  green:"#34c759", red:"#ff3b30", amber:"#ff9f0a", purple:"#af52de",
+  purpleBg:"#f3e8fd",
 };
 const shadowSm = "0 1px 4px rgba(0,0,0,0.08)";
+const PALETTE = [C.blue, C.green, C.amber, C.purple, "#ff6b81", "#5ac8fa", "#ff9f0a", "#86868b"];
+const YEAR_COLORS = ["#c7c7cc", "#5ac8fa", C.blue];
 
-type KPI   = { label:string; value:string; trend:"up"|"down"|"neutral"; color:string };
-type Point = { label:string; value:number; color?:string };
-type Chart = { type:"bar"|"line"|"pie"|"donut"; title:string; data:Point[] };
-type DashboardData = { summary:string; kpis:KPI[]; insights:string[]; warnings:string[]; actions:string[]; charts:Chart[] };
-type Payload = { dashboardData:DashboardData; narrative:string; bizName:string; mode:string; analyzedAt?:string };
+// ── Static-report types (Claude JSON) ─────────────────────
+type SKPI   = { label:string; value:string; trend:"up"|"down"|"neutral"; color:string };
+type SPoint = { label:string; value:number; color?:string };
+type SChart = { type:"bar"|"line"|"pie"|"donut"; title:string; data:SPoint[] };
+type DashboardData = { summary:string; kpis:SKPI[]; insights:string[]; warnings:string[]; actions:string[]; charts:SChart[] };
+type Payload = {
+  dashboardData:DashboardData; narrative:string; bizName:string; mode:string;
+  analyzedAt?:string; folderId?:string;
+  cubeFiles?: { id:string; name:string }[];
+};
 
-const fmtVal = (v:number) =>
+// ── Agent view spec (validated server-side) ────────────────
+type AgentChart = { type:"bar"|"line"|"donut"; title:string; dimension:string; measure:MeasureSpec; topN:number };
+type AgentKpi   = { label:string; measure:MeasureSpec };
+type AgentSpec  = {
+  filters: Filters; grain: Grain; yoy: boolean;
+  dateWindow?: DateWindow; kpis: AgentKpi[]; charts: AgentChart[]; note: string;
+};
+
+const fmtCompact = (v:number) =>
   Math.abs(v) >= 1_000_000 ? `${(v/1_000_000).toFixed(1)}M`
-  : Math.abs(v) >= 1_000   ? `${(v/1_000).toFixed(0)}K`
+  : Math.abs(v) >= 10_000  ? `${(v/1_000).toFixed(0)}K`
   : v % 1 === 0 ? v.toLocaleString() : v.toFixed(1);
 
-function BarChart({ chart }: { chart: Chart }) {
-  const max = Math.max(...chart.data.map(d => d.value), 1);
+function Spinner({ size=18, color=C.blue }: { size?:number; color?:string }) {
+  return <div style={{ width:size, height:size, border:`2px solid ${color}30`, borderTopColor:color, borderRadius:"50%", animation:"spin .7s linear infinite", flexShrink:0 }}/>;
+}
+
+// ═══════════════ SVG CHART PRIMITIVES ═══════════════
+function HBarChart({ title, data, money }: { title:string; data:{label:string; value:number}[]; money?:(v:number)=>string }) {
+  const max = Math.max(...data.map(d => Math.abs(d.value)), 1);
+  const fmt = money || fmtCompact;
   return (
-    <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:18, padding:20, boxShadow:shadowSm }}>
-      <div style={{ fontWeight:600, fontSize:14, color:C.text, marginBottom:16 }}>{chart.title}</div>
-      <div style={{ display:"flex", flexDirection:"column", gap:9 }}>
-        {chart.data.slice(0,10).map((d,i) => (
-          <div key={i} style={{ display:"flex", alignItems:"center", gap:10 }}>
-            <div title={d.label} style={{ fontSize:12, color:C.text2, width:110, flexShrink:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{d.label}</div>
-            <div style={{ flex:1, background:C.bg, borderRadius:5, height:22, overflow:"hidden" }}>
-              <div style={{ height:"100%", width:`${Math.max((d.value/max)*100, 2)}%`, background:d.color||C.blue, borderRadius:5, transition:"width .6s ease" }}/>
+    <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:16, padding:18, boxShadow:shadowSm }}>
+      <div style={{ fontWeight:600, fontSize:13, color:C.text, marginBottom:14 }}>{title}</div>
+      <div style={{ display:"flex", flexDirection:"column", gap:8 }}>
+        {data.map((d,i) => (
+          <div key={i} style={{ display:"flex", alignItems:"center", gap:9 }}>
+            <div title={d.label} style={{ fontSize:11.5, color:C.text2, width:104, flexShrink:0, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{d.label}</div>
+            <div style={{ flex:1, background:C.bg, borderRadius:4, height:19, overflow:"hidden" }}>
+              <div style={{ height:"100%", width:`${Math.max((Math.abs(d.value)/max)*100, 1.5)}%`, background: d.value < 0 ? C.red : PALETTE[i % PALETTE.length], borderRadius:4, transition:"width .4s ease" }}/>
             </div>
-            <div style={{ fontSize:12, fontWeight:600, color:C.text, width:64, textAlign:"right", flexShrink:0 }}>{fmtVal(d.value)}</div>
+            <div style={{ fontSize:11.5, fontWeight:600, color:d.value<0?C.red:C.text, width:62, textAlign:"right", flexShrink:0 }}>{fmt(d.value)}</div>
           </div>
         ))}
+        {data.length === 0 && <div style={{ fontSize:12, color:C.text3, padding:"8px 0" }}>No data for current filters.</div>}
       </div>
     </div>
   );
 }
 
-function PieChart({ chart }: { chart: Chart }) {
-  const total = chart.data.reduce((s,d) => s + Math.max(d.value,0), 0);
-  if (total <= 0) return null;
-  const isDonut = chart.type === "donut";
-  const size = 170, cx = size/2, cy = size/2, r = 72, innerR = isDonut ? 40 : 0;
-  const palette = [C.blue, C.green, C.amber, "#af52de", "#ff3b30", "#5ac8fa", "#ff6b81", "#86868b"];
+function TrendChart({ title, series, money, overlay }: {
+  title:string;
+  series:{label:string; value:number}[];
+  money?:(v:number)=>string;
+  overlay?: { years:string[]; points:{ label:string; values:Record<string, number|null> }[] } | null;
+}) {
+  const fmt = money || fmtCompact;
+  const W = 560, H = 200, padL = 44, padR = 12, padT = 14, padB = 28;
 
-  let angle = -Math.PI/2;
-  const slices = chart.data.slice(0,8).map((d,i) => {
-    const pct = Math.max(d.value,0)/total;
-    const start = angle;
-    angle += pct * 2 * Math.PI;
-    return { ...d, color: d.color || palette[i % palette.length], pct, a0:start, a1:angle };
-  });
-
-  function arc(a0:number, a1:number) {
-    // Handle full circle (single slice)
-    if (a1 - a0 >= 2*Math.PI - 0.001) a1 = a0 + 2*Math.PI - 0.001;
-    const x1=cx+r*Math.cos(a0), y1=cy+r*Math.sin(a0);
-    const x2=cx+r*Math.cos(a1), y2=cy+r*Math.sin(a1);
-    const large = a1-a0 > Math.PI ? 1 : 0;
-    if (innerR === 0) return `M ${cx} ${cy} L ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} Z`;
-    const x3=cx+innerR*Math.cos(a1), y3=cy+innerR*Math.sin(a1);
-    const x4=cx+innerR*Math.cos(a0), y4=cy+innerR*Math.sin(a0);
-    return `M ${x1} ${y1} A ${r} ${r} 0 ${large} 1 ${x2} ${y2} L ${x3} ${y3} A ${innerR} ${innerR} 0 ${large} 0 ${x4} ${y4} Z`;
+  let lines: { name:string; color:string; pts:(number|null)[] }[] = [];
+  let labels: string[] = [];
+  if (overlay && overlay.years.length >= 2) {
+    labels = overlay.points.map(p => p.label);
+    lines = overlay.years.map((y, i) => ({
+      name: y,
+      color: YEAR_COLORS[Math.max(0, YEAR_COLORS.length - overlay.years.length + i)] || PALETTE[i],
+      pts: overlay.points.map(p => p.values[y]),
+    }));
+  } else {
+    labels = series.map(s => s.label);
+    lines = [{ name:"", color:C.blue, pts: series.map(s => s.value) }];
   }
 
+  const all = lines.flatMap(l => l.pts).filter((v): v is number => v !== null);
+  if (all.length === 0) return (
+    <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:16, padding:18, boxShadow:shadowSm }}>
+      <div style={{ fontWeight:600, fontSize:13, color:C.text, marginBottom:8 }}>{title}</div>
+      <div style={{ fontSize:12, color:C.text3 }}>No data for current filters.</div>
+    </div>
+  );
+  const max = Math.max(...all), min = Math.min(...all, 0);
+  const range = max - min || 1;
+  const n = labels.length;
+  const X = (i:number) => padL + (n <= 1 ? (W-padL-padR)/2 : (i/(n-1)) * (W-padL-padR));
+  const Y = (v:number) => H - padB - ((v - min)/range) * (H-padT-padB);
+
   return (
-    <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:18, padding:20, boxShadow:shadowSm }}>
-      <div style={{ fontWeight:600, fontSize:14, color:C.text, marginBottom:16 }}>{chart.title}</div>
-      <div style={{ display:"flex", alignItems:"center", gap:18, flexWrap:"wrap" }}>
+    <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:16, padding:18, boxShadow:shadowSm }}>
+      <div style={{ display:"flex", alignItems:"center", justifyContent:"space-between", marginBottom:10, gap:8, flexWrap:"wrap" }}>
+        <div style={{ fontWeight:600, fontSize:13, color:C.text }}>{title}</div>
+        {lines.length > 1 && (
+          <div style={{ display:"flex", gap:10 }}>
+            {lines.map(l => (
+              <span key={l.name} style={{ fontSize:10.5, color:C.text2, display:"flex", alignItems:"center", gap:4 }}>
+                <span style={{ width:10, height:3, borderRadius:2, background:l.color, display:"inline-block" }}/>{l.name}
+              </span>
+            ))}
+          </div>
+        )}
+      </div>
+      <svg width="100%" viewBox={`0 0 ${W} ${H}`}>
+        {[0, 0.5, 1].map((t,i) => {
+          const y = padT + t*(H-padT-padB);
+          const v = max - t*range;
+          return <g key={i}>
+            <line x1={padL} y1={y} x2={W-padR} y2={y} stroke={C.border} strokeWidth={1}/>
+            <text x={padL-4} y={y+3} textAnchor="end" style={{ fontSize:8.5, fill:C.text3 }}>{fmt(v)}</text>
+          </g>;
+        })}
+        {lines.map((l, li) => {
+          const segs: string[] = [];
+          let cur: string[] = [];
+          l.pts.forEach((v, i) => {
+            if (v === null) { if (cur.length) { segs.push(cur.join(" ")); cur = []; } return; }
+            cur.push(`${X(i)},${Y(v)}`);
+          });
+          if (cur.length) segs.push(cur.join(" "));
+          return <g key={li}>
+            {segs.map((s, si) => <polyline key={si} points={s} fill="none" stroke={l.color} strokeWidth={2.2} strokeLinejoin="round" strokeLinecap="round"/>)}
+            {l.pts.map((v, i) => v === null ? null : (
+              <circle key={i} cx={X(i)} cy={Y(v)} r={2.6} fill={l.color} stroke="#fff" strokeWidth={1.2}>
+                <title>{labels[i]}{l.name ? ` (${l.name})` : ""}: {fmt(v)}</title>
+              </circle>
+            ))}
+          </g>;
+        })}
+        {labels.filter((_,i) => n <= 13 || i % Math.ceil(n/13) === 0).map((lb, i, arr) => {
+          const realIdx = labels.indexOf(lb, i === 0 ? 0 : labels.indexOf(arr[i-1])+1);
+          return <text key={i} x={X(realIdx)} y={H-8} textAnchor="middle" style={{ fontSize:8, fill:C.text3 }}>
+            {lb.length > 9 ? lb.slice(0,9) : lb}
+          </text>;
+        })}
+      </svg>
+    </div>
+  );
+}
+
+function DonutChart({ title, data, money }: { title:string; data:{label:string; value:number}[]; money?:(v:number)=>string }) {
+  const pos = data.filter(d => d.value > 0);
+  const total = pos.reduce((s,d) => s + d.value, 0);
+  const fmt = money || fmtCompact;
+  if (total <= 0) return null;
+  const size=150, cx=size/2, cy=size/2, r=62, innerR=36;
+  let angle = -Math.PI/2;
+  const slices = pos.slice(0,8).map((d,i) => {
+    const pct = d.value/total;
+    const a0 = angle; angle += pct*2*Math.PI;
+    return { ...d, color:PALETTE[i % PALETTE.length], pct, a0, a1:angle };
+  });
+  function arc(a0:number, a1:number) {
+    if (a1-a0 >= 2*Math.PI-0.001) a1 = a0 + 2*Math.PI - 0.001;
+    const x1=cx+r*Math.cos(a0), y1=cy+r*Math.sin(a0), x2=cx+r*Math.cos(a1), y2=cy+r*Math.sin(a1);
+    const x3=cx+innerR*Math.cos(a1), y3=cy+innerR*Math.sin(a1), x4=cx+innerR*Math.cos(a0), y4=cy+innerR*Math.sin(a0);
+    const lg = a1-a0 > Math.PI ? 1 : 0;
+    return `M ${x1} ${y1} A ${r} ${r} 0 ${lg} 1 ${x2} ${y2} L ${x3} ${y3} A ${innerR} ${innerR} 0 ${lg} 0 ${x4} ${y4} Z`;
+  }
+  return (
+    <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:16, padding:18, boxShadow:shadowSm }}>
+      <div style={{ fontWeight:600, fontSize:13, color:C.text, marginBottom:12 }}>{title}</div>
+      <div style={{ display:"flex", alignItems:"center", gap:14, flexWrap:"wrap" }}>
         <svg width={size} height={size} style={{ flexShrink:0 }}>
           {slices.map((s,i) => <path key={i} d={arc(s.a0,s.a1)} fill={s.color} stroke="#fff" strokeWidth={1.5}/>)}
-          {isDonut && (
-            <text x={cx} y={cy+4} textAnchor="middle" style={{ fontSize:13, fontWeight:700, fill:C.text }}>{fmtVal(total)}</text>
-          )}
+          <text x={cx} y={cy+4} textAnchor="middle" style={{ fontSize:11.5, fontWeight:700, fill:C.text }}>{fmt(total)}</text>
         </svg>
-        <div style={{ display:"flex", flexDirection:"column", gap:6, flex:1, minWidth:140 }}>
+        <div style={{ display:"flex", flexDirection:"column", gap:5, flex:1, minWidth:120 }}>
           {slices.map((s,i) => (
-            <div key={i} style={{ display:"flex", alignItems:"center", gap:8 }}>
-              <div style={{ width:10, height:10, borderRadius:3, background:s.color, flexShrink:0 }}/>
-              <span style={{ fontSize:12, color:C.text2, flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{s.label}</span>
-              <span style={{ fontSize:12, fontWeight:600, color:C.text }}>{(s.pct*100).toFixed(1)}%</span>
+            <div key={i} style={{ display:"flex", alignItems:"center", gap:7 }}>
+              <span style={{ width:9, height:9, borderRadius:2.5, background:s.color, flexShrink:0 }}/>
+              <span style={{ fontSize:11, color:C.text2, flex:1, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{s.label}</span>
+              <span style={{ fontSize:11, fontWeight:600, color:C.text }}>{(s.pct*100).toFixed(1)}%</span>
             </div>
           ))}
         </div>
@@ -93,37 +206,416 @@ function PieChart({ chart }: { chart: Chart }) {
   );
 }
 
-function LineChart({ chart }: { chart: Chart }) {
-  if (chart.data.length < 2) return <BarChart chart={chart}/>;
-  const vals = chart.data.map(d => d.value);
-  const max = Math.max(...vals), min = Math.min(...vals);
-  const range = max - min || 1;
-  const W = 420, H = 170, pad = 32;
-  const color = chart.data[0]?.color || C.blue;
+// ═══════════════ EXPLORE TAB ═══════════════
+function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
+  const cubeFiles = payload.cubeFiles || [];
+  const [fileId, setFileId]     = useState(cubeFiles[0]?.id || "");
+  const [cube, setCube]         = useState<DataCube | null>(null);
+  const [loading, setLoading]   = useState(true);
+  const [loadErr, setLoadErr]   = useState("");
 
-  const pts = chart.data.map((d,i) => ({
-    x: pad + (i/(chart.data.length-1)) * (W - pad*2),
-    y: H - pad - ((d.value - min)/range) * (H - pad*2),
-    ...d,
-  }));
-  const poly = pts.map(p => `${p.x},${p.y}`).join(" ");
-  const area = `M ${pts[0].x} ${H-pad} ` + pts.map(p=>`L ${p.x} ${p.y}`).join(" ") + ` L ${pts[pts.length-1].x} ${H-pad} Z`;
+  const [filters, setFilters]   = useState<Filters>({});
+  const [preset, setPreset]     = useState<"all"|"ytd"|"l12m"|"lastyear"|"custom">("all");
+  const [customFrom, setCustomFrom] = useState("");
+  const [customTo, setCustomTo]     = useState("");
+  const [grain, setGrain]       = useState<Grain>("month");
+  const [yoyOn, setYoyOn]       = useState(false);
+  const [measure, setMeasure]   = useState("");
+
+  const [agentOpen, setAgentOpen]       = useState(false);
+  const [agentQ, setAgentQ]             = useState("");
+  const [agentLoading, setAgentLoading] = useState(false);
+  const [agentErr, setAgentErr]         = useState("");
+  const [agentView, setAgentView]       = useState<AgentSpec | null>(null);
+
+  // Load cube whenever file changes
+  useEffect(() => {
+    if (!fileId || !payload.folderId) { setLoading(false); return; }
+    setLoading(true); setLoadErr(""); setCube(null); setAgentView(null);
+    getFileCube<DataCube>(user.uid, payload.folderId, fileId)
+      .then(cb => {
+        if (!cb) { setLoadErr("No interactive data found for this file. Re-upload it to enable filtering."); return; }
+        setCube(cb);
+        const caps = timeCapabilities(cb);
+        setGrain(caps.grains.includes("month") ? "month" : caps.grains[0]);
+        setMeasure(cb.moneyMeasures[0] || cb.measures[0] || "");
+        setFilters({}); setPreset("all"); setYoyOn(false);
+      })
+      .catch(() => setLoadErr("Failed to load dashboard data. Check your connection and reopen."))
+      .finally(() => setLoading(false));
+  }, [fileId, payload.folderId, user.uid]);
+
+  const caps = useMemo(() => cube ? timeCapabilities(cube) : null, [cube]);
+
+  const win: DateWindow = useMemo(() => {
+    if (!cube) return {};
+    if (preset === "custom") return { from: customFrom || undefined, to: customTo || undefined };
+    return presetWindow(cube, preset);
+  }, [cube, preset, customFrom, customTo]);
+
+  const rows = useMemo(() => cube ? filterRows(cube, filters, win) : [], [cube, filters, win]);
+
+  const money = useCallback((field:string) => (v:number) => cube ? formatMeasureValue(v, field, cube) : fmtCompact(v), [cube]);
+  const spec: MeasureSpec = useMemo(() => ({ kind:"field", field: measure }), [measure]);
+
+  const trend   = useMemo(() => cube && measure ? seriesByGrain(rows, grain, spec) : [], [cube, rows, grain, spec, measure]);
+  const overlay = useMemo(() => cube && yoyOn && caps?.yoy ? yoyOverlay(rows, spec) : null, [cube, rows, spec, yoyOn, caps]);
+
+  function toggleFilter(dim:string, val:string) {
+    setFilters(prev => {
+      const cur = new Set(prev[dim] || []);
+      if (cur.has(val)) cur.delete(val); else cur.add(val);
+      const next = { ...prev };
+      if (cur.size === 0) delete next[dim]; else next[dim] = [...cur];
+      return next;
+    });
+  }
+  const activeFilterCount = Object.values(filters).reduce((s,v) => s + v.length, 0);
+
+  async function askAgent(q?: string) {
+    if (!cube || agentLoading) return;
+    const question = (q ?? agentQ).trim();
+    if (!question) return;
+    setAgentLoading(true); setAgentErr("");
+    try {
+      const schema = {
+        fileName: cube.fileName, dateField: cube.dateField, dateRange: cube.dateRange,
+        grains: caps?.grains || ["month"], multiYear: !!caps?.multiYear,
+        dimensions: cube.dimensions, measures: cube.measures,
+      };
+      const res  = await fetch("/api/dashboard-agent", {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ question, schema }),
+      });
+      const data = await res.json() as { success?:boolean; unsupported?:boolean; note?:string; spec?:AgentSpec; error?:string };
+      if (!res.ok) throw new Error(data.error || `Server error (${res.status})`);
+      if (data.unsupported) { setAgentErr(data.note || "This question needs the Advisor chat."); return; }
+      if (!data.spec) throw new Error("Agent returned no view.");
+      // Apply the spec to the live controls so the sidebar reflects it
+      setFilters(data.spec.filters || {});
+      if (caps?.grains.includes(data.spec.grain)) setGrain(data.spec.grain);
+      setYoyOn(!!data.spec.yoy && !!caps?.yoy);
+      if (data.spec.dateWindow?.from || data.spec.dateWindow?.to) {
+        setPreset("custom");
+        setCustomFrom(data.spec.dateWindow.from || "");
+        setCustomTo(data.spec.dateWindow.to || "");
+      } else setPreset("all");
+      setAgentView(data.spec);
+      setAgentOpen(false); setAgentQ("");
+    } catch (err) {
+      setAgentErr(err instanceof Error ? err.message : "Agent failed. Try again.");
+    } finally { setAgentLoading(false); }
+  }
+
+  function resetView() {
+    setAgentView(null); setFilters({}); setPreset("all"); setYoyOn(false);
+    if (cube) { const cp = timeCapabilities(cube); setGrain(cp.grains.includes("month") ? "month" : cp.grains[0]); }
+  }
+
+  if (loading) return <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12, padding:60 }}><Spinner size={26}/><span style={{ fontSize:13, color:C.text3 }}>Loading interactive data...</span></div>;
+  if (loadErr || !cube) return (
+    <div style={{ textAlign:"center", padding:"50px 20px" }}>
+      <div style={{ fontSize:40, marginBottom:12 }}>📊</div>
+      <div style={{ fontSize:14, fontWeight:600, color:C.text, marginBottom:6 }}>Interactive view unavailable</div>
+      <div style={{ fontSize:13, color:C.text3, maxWidth:420, margin:"0 auto" }}>{loadErr || "No data cube found."}</div>
+    </div>
+  );
+
+  const kpiSpecs: AgentKpi[] = agentView?.kpis?.length
+    ? agentView.kpis
+    : cube.measures.slice(0, 4).map(m => ({ label: m, measure: { kind:"field", field:m } as MeasureSpec }));
+
+  const chartSpecs: AgentChart[] = agentView?.charts?.length
+    ? agentView.charts
+    : [
+        { type:"line",  title:`${measure} over time`, dimension:"_date", measure:spec, topN:10 },
+        ...cube.dimensions.slice(0, 2).map((d, i) => ({
+          type: (i === 1 ? "donut" : "bar") as AgentChart["type"],
+          title:`${measure} by ${d.name}`, dimension:d.name, measure:spec, topN:10,
+        })),
+      ];
+
+  const isPctSpec = (m:MeasureSpec) => m.kind === "marginPct" || (m.kind === "ratio" && !!m.pct);
+  const fmtForSpec = (m:MeasureSpec) => (v:number) => {
+    if (isPctSpec(m)) return `${v.toFixed(1)}%`;
+    if (m.kind === "field") return formatMeasureValue(v, m.field, cube);
+    if (m.kind === "ratio") return v.toFixed(2);
+    return fmtCompact(v);
+  };
 
   return (
-    <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:18, padding:20, boxShadow:shadowSm }}>
-      <div style={{ fontWeight:600, fontSize:14, color:C.text, marginBottom:14 }}>{chart.title}</div>
-      <svg width="100%" viewBox={`0 0 ${W} ${H}`}>
-        {[0,0.5,1].map((t,i) => <line key={i} x1={pad} y1={pad+t*(H-pad*2)} x2={W-pad} y2={pad+t*(H-pad*2)} stroke={C.border} strokeWidth={1}/>)}
-        <path d={area} fill={color} fillOpacity={0.08}/>
-        <polyline points={poly} fill="none" stroke={color} strokeWidth={2.5} strokeLinejoin="round" strokeLinecap="round"/>
-        {pts.map((p,i) => <circle key={i} cx={p.x} cy={p.y} r={3.5} fill={color} stroke="#fff" strokeWidth={1.5}><title>{p.label}: {p.value}</title></circle>)}
-        {pts.filter((_,i) => pts.length <= 10 || i % Math.ceil(pts.length/10) === 0).map((p,i) => (
-          <text key={i} x={p.x} y={H-8} textAnchor="middle" style={{ fontSize:9, fill:C.text3 }}>
-            {p.label.length > 8 ? p.label.slice(0,8) : p.label}
-          </text>
+    <div style={{ display:"flex", gap:16, alignItems:"flex-start" }}>
+
+      {/* ══ LEFT SIDEBAR ══ */}
+      <div style={{ width:226, flexShrink:0, position:"sticky", top:76, display:"flex", flexDirection:"column", gap:12, maxHeight:"calc(100vh - 100px)", overflowY:"auto", paddingRight:2 }}>
+
+        {/* Agent button */}
+        <button onClick={()=>{ setAgentOpen(true); setAgentErr(""); }} style={{
+          background:`linear-gradient(135deg, ${C.purple} 0%, #7a35b8 100%)`, color:"#fff", border:"none",
+          borderRadius:12, padding:"13px 14px", fontSize:13, fontWeight:600, cursor:"pointer",
+          boxShadow:"0 4px 14px rgba(175,82,222,0.35)", textAlign:"left",
+        }}>
+          🤖 Ask the Agent
+          <div style={{ fontSize:10.5, fontWeight:400, opacity:.85, marginTop:3 }}>Describe a view — it builds it for you</div>
+        </button>
+
+        {agentView && (
+          <div style={{ background:C.purpleBg, border:`1px solid #e0c5f5`, borderRadius:10, padding:"10px 12px" }}>
+            <div style={{ fontSize:11, fontWeight:600, color:C.purple, marginBottom:4 }}>🤖 Agent view active</div>
+            <div style={{ fontSize:11, color:C.text2, lineHeight:1.5, marginBottom:8 }}>{agentView.note}</div>
+            <button onClick={resetView} style={{ fontSize:11, fontWeight:600, color:C.purple, background:"#fff", border:`1px solid #e0c5f5`, borderRadius:7, padding:"5px 10px", cursor:"pointer", width:"100%" }}>← Back to default view</button>
+          </div>
+        )}
+
+        {/* File switcher */}
+        {cubeFiles.length > 1 && (
+          <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, padding:"12px 13px", boxShadow:shadowSm }}>
+            <div style={{ fontSize:10, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3, marginBottom:8 }}>Data source</div>
+            <select value={fileId} onChange={e=>setFileId(e.target.value)} style={{ width:"100%", fontSize:12, padding:"7px 8px", borderRadius:8, border:`1px solid ${C.border}`, background:C.bg, color:C.text, outline:"none", cursor:"pointer" }}>
+              {cubeFiles.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+            </select>
+            <div style={{ fontSize:10, color:C.text3, marginTop:6 }}>Sheet: {cube.sheetName} · {cube.sourceRowCount.toLocaleString()} rows</div>
+          </div>
+        )}
+
+        {/* Time intelligence */}
+        <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, padding:"12px 13px", boxShadow:shadowSm }}>
+          <div style={{ fontSize:10, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3, marginBottom:8 }}>📅 Time period</div>
+          <div style={{ display:"flex", flexDirection:"column", gap:4 }}>
+            {([["all","All time"],["ytd","Year to date"],["l12m","Last 12 months"],["lastyear","Last year"],["custom","Custom range"]] as const).map(([k, lbl]) => (
+              <button key={k} onClick={()=>setPreset(k)} style={{
+                textAlign:"left", fontSize:12, padding:"7px 10px", borderRadius:8, cursor:"pointer",
+                background: preset===k ? C.blueBg : "transparent",
+                border: preset===k ? `1px solid #c0d8f5` : "1px solid transparent",
+                color: preset===k ? C.blue : C.text2, fontWeight: preset===k ? 600 : 400,
+              }}>{lbl}</button>
+            ))}
+          </div>
+          {preset === "custom" && (
+            <div style={{ marginTop:8, display:"flex", flexDirection:"column", gap:6 }}>
+              <input type="date" value={customFrom} min={cube.dateRange.min} max={cube.dateRange.max} onChange={e=>setCustomFrom(e.target.value)} style={{ fontSize:11.5, padding:"6px 8px", borderRadius:7, border:`1px solid ${C.border}`, color:C.text }}/>
+              <input type="date" value={customTo} min={cube.dateRange.min} max={cube.dateRange.max} onChange={e=>setCustomTo(e.target.value)} style={{ fontSize:11.5, padding:"6px 8px", borderRadius:7, border:`1px solid ${C.border}`, color:C.text }}/>
+            </div>
+          )}
+
+          {/* Grain */}
+          <div style={{ fontSize:10, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3, margin:"12px 0 7px" }}>Granularity</div>
+          <div style={{ display:"flex", gap:4, flexWrap:"wrap" }}>
+            {(caps?.grains || []).map(g => (
+              <button key={g} onClick={()=>setGrain(g)} style={{
+                fontSize:11, padding:"5px 10px", borderRadius:14, cursor:"pointer", textTransform:"capitalize",
+                background: grain===g ? C.blue : C.bg, color: grain===g ? "#fff" : C.text2,
+                border: `1px solid ${grain===g ? C.blue : C.border}`, fontWeight: grain===g ? 600 : 400,
+              }}>{g}</button>
+            ))}
+          </div>
+
+          {/* YoY toggle */}
+          {caps?.yoy && (
+            <button onClick={()=>setYoyOn(v=>!v)} style={{
+              marginTop:10, width:"100%", fontSize:11.5, fontWeight:600, padding:"8px 10px", borderRadius:8, cursor:"pointer",
+              background: yoyOn ? C.green : C.bg, color: yoyOn ? "#fff" : C.text2,
+              border: `1px solid ${yoyOn ? C.green : C.border}`,
+            }}>
+              {yoyOn ? "✓ " : ""}Compare years (YoY)
+            </button>
+          )}
+          <div style={{ fontSize:10, color:C.text3, marginTop:8 }}>
+            Data: {cube.dateRange.min} → {cube.dateRange.max}
+            {caps?.multiYear && <span style={{ color:C.green, fontWeight:600 }}> · multi-year ✓</span>}
+          </div>
+        </div>
+
+        {/* Dimension filters */}
+        {cube.dimensions.map(dim => (
+          <div key={dim.name} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, padding:"12px 13px", boxShadow:shadowSm }}>
+            <div style={{ display:"flex", justifyContent:"space-between", alignItems:"center", marginBottom:8 }}>
+              <span style={{ fontSize:10, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3 }}>{dim.name}</span>
+              {(filters[dim.name]?.length || 0) > 0 && (
+                <button onClick={()=>setFilters(prev => { const n = {...prev}; delete n[dim.name]; return n; })} style={{ fontSize:10, color:C.blue, background:"none", border:"none", cursor:"pointer", fontWeight:600 }}>clear</button>
+              )}
+            </div>
+            <div style={{ display:"flex", flexDirection:"column", gap:3, maxHeight:150, overflowY:"auto" }}>
+              {dim.values.map(v => {
+                const on = filters[dim.name]?.includes(v) || false;
+                return (
+                  <label key={v} style={{ display:"flex", alignItems:"center", gap:7, fontSize:12, color: on ? C.text : C.text2, cursor:"pointer", padding:"3px 2px" }}>
+                    <input type="checkbox" checked={on} onChange={()=>toggleFilter(dim.name, v)} style={{ accentColor:C.blue, cursor:"pointer" }}/>
+                    <span style={{ overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap", fontWeight: on ? 600 : 400 }}>{v}</span>
+                  </label>
+                );
+              })}
+            </div>
+          </div>
         ))}
-      </svg>
+
+        {activeFilterCount > 0 && (
+          <button onClick={()=>setFilters({})} style={{ fontSize:12, fontWeight:600, color:C.red, background:"#ffeceb", border:"1px solid #ffd6d6", borderRadius:10, padding:"9px", cursor:"pointer" }}>
+            ✕ Clear all filters ({activeFilterCount})
+          </button>
+        )}
+      </div>
+
+      {/* ══ MAIN AREA ══ */}
+      <div style={{ flex:1, minWidth:0, display:"flex", flexDirection:"column", gap:16 }}>
+
+        {/* Measure selector + row count */}
+        <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+          <span style={{ fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3 }}>Measure:</span>
+          {cube.measures.slice(0, 6).map(m => (
+            <button key={m} onClick={()=>setMeasure(m)} style={{
+              fontSize:12, padding:"6px 13px", borderRadius:16, cursor:"pointer",
+              background: measure===m ? C.text : C.surface, color: measure===m ? "#fff" : C.text2,
+              border:`1px solid ${measure===m ? C.text : C.border}`, fontWeight: measure===m ? 600 : 400,
+            }}>{m}</button>
+          ))}
+          <span style={{ marginLeft:"auto", fontSize:11, color:C.text3 }}>
+            {rows.reduce((s,r)=>s+r.n,0).toLocaleString()} rows in view
+          </span>
+        </div>
+
+        {/* KPI cards */}
+        <div style={{ display:"grid", gridTemplateColumns:`repeat(auto-fit, minmax(170px, 1fr))`, gap:12 }}>
+          {kpiSpecs.map((k, i) => {
+            const val = computeMeasure(rows, k.measure);
+            const cmp = caps?.yoy && !yoyOn ? periodComparison(cube, filters, k.measure, 365) : null;
+            return (
+              <div key={i} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:14, padding:"15px 17px", boxShadow:shadowSm }}>
+                <div style={{ fontSize:10.5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3, marginBottom:8, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{k.label}</div>
+                <div style={{ fontSize:21, fontWeight:700, letterSpacing:"-0.4px", color:C.text }}>{fmtForSpec(k.measure)(val)}</div>
+                {cmp && cmp.deltaPct !== null && preset === "all" && (
+                  <div style={{ fontSize:10.5, fontWeight:600, marginTop:5, color: cmp.deltaPct >= 0 ? C.green : C.red }}>
+                    {cmp.deltaPct >= 0 ? "▲" : "▼"} {Math.abs(cmp.deltaPct).toFixed(1)}% vs prior 12 months
+                  </div>
+                )}
+              </div>
+            );
+          })}
+        </div>
+
+        {/* Charts */}
+        {chartSpecs.map((ch, i) => {
+          const fmt = fmtForSpec(ch.measure);
+          if (ch.dimension === "_date") {
+            const s  = seriesByGrain(rows, grain, ch.measure);
+            const ov = yoyOn && caps?.yoy ? yoyOverlay(rows, ch.measure) : null;
+            return <TrendChart key={i} title={ch.title + (yoyOn ? " — year comparison" : "")} series={s} overlay={ov} money={fmt}/>;
+          }
+          const data = byDimension(rows, ch.dimension, ch.measure, ch.topN);
+          if (ch.type === "donut") return <DonutChart key={i} title={ch.title} data={data} money={fmt}/>;
+          return <HBarChart key={i} title={ch.title} data={data} money={fmt}/>;
+        })}
+
+        <div style={{ fontSize:10.5, color:C.text3, textAlign:"center", padding:"4px 0 12px" }}>
+          Every number is computed locally from your data — filters, time windows, and comparisons never call AI.
+        </div>
+      </div>
+
+      {/* ══ AGENT MODAL ══ */}
+      {agentOpen && (
+        <div onClick={()=>!agentLoading && setAgentOpen(false)} style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", zIndex:200, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
+          <div onClick={e=>e.stopPropagation()} style={{ background:C.surface, borderRadius:18, padding:24, width:"100%", maxWidth:520, boxShadow:"0 20px 60px rgba(0,0,0,0.3)" }}>
+            <div style={{ fontSize:16, fontWeight:700, color:C.text, marginBottom:4 }}>🤖 Dashboard Agent</div>
+            <div style={{ fontSize:12, color:C.text3, marginBottom:14 }}>Describe the view you want. The agent designs it — your browser computes the numbers.</div>
+            {agentErr && <div style={{ background:"#fff8e8", border:"1px solid #ffe4a0", color:"#996600", fontSize:12, padding:"9px 12px", borderRadius:9, marginBottom:12, lineHeight:1.5 }}>{agentErr}</div>}
+            <textarea
+              autoFocus value={agentQ} onChange={e=>setAgentQ(e.target.value)}
+              onKeyDown={e=>{ if (e.key==="Enter" && !e.shiftKey) { e.preventDefault(); askAgent(); } }}
+              placeholder={`e.g. "Show ${cube.measures[0] || "revenue"} by ${cube.dimensions[0]?.name || "category"}, quarterly, compared by year"`}
+              rows={3}
+              style={{ width:"100%", boxSizing:"border-box", fontSize:13, padding:"11px 13px", borderRadius:10, border:`1px solid ${C.border}`, outline:"none", resize:"vertical", color:C.text, fontFamily:"inherit" }}
+            />
+            <div style={{ display:"flex", flexWrap:"wrap", gap:6, margin:"10px 0 14px" }}>
+              {[
+                caps?.yoy ? "Compare this year vs last year" : `Monthly ${cube.measures[0] || "totals"} trend`,
+                `Top 10 ${cube.dimensions[0]?.name || "items"} by ${cube.measures[0] || "value"}`,
+                cube.measures.length >= 2 ? `${cube.measures[0]} vs ${cube.measures[1]} ratio by ${cube.dimensions[0]?.name || "group"}` : "Where are the negative values?",
+              ].map(q => (
+                <button key={q} onClick={()=>askAgent(q)} disabled={agentLoading} style={{ fontSize:11, background:C.bg, border:`1px solid ${C.border}`, borderRadius:14, padding:"6px 11px", color:C.text2, cursor:"pointer" }}>{q}</button>
+              ))}
+            </div>
+            <div style={{ display:"flex", gap:10, justifyContent:"flex-end" }}>
+              <button onClick={()=>setAgentOpen(false)} disabled={agentLoading} style={{ fontSize:13, padding:"9px 16px", borderRadius:9, background:"transparent", border:`1px solid ${C.border}`, color:C.text2, cursor:"pointer" }}>Cancel</button>
+              <button onClick={()=>askAgent()} disabled={agentLoading || !agentQ.trim()} style={{ fontSize:13, fontWeight:600, padding:"9px 20px", borderRadius:9, background:C.purple, border:"none", color:"#fff", cursor:"pointer", opacity:agentLoading||!agentQ.trim()?.6:1, display:"flex", alignItems:"center", gap:8 }}>
+                {agentLoading ? <><Spinner size={13} color="#fff"/> Designing view...</> : "Build view ✨"}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
+  );
+}
+
+// ═══════════════ STATIC REPORT TAB (Claude JSON) ═══════════════
+function StaticBar({ chart }: { chart: SChart }) {
+  return <HBarChart title={chart.title} data={chart.data.slice(0,10)}/>;
+}
+function StaticReport({ dd }: { dd: DashboardData }) {
+  const trendIcon  = (t:string) => t==="up" ? "↑" : t==="down" ? "↓" : "→";
+  const trendColor = (t:string) => t==="up" ? C.green : t==="down" ? C.red : C.text3;
+  return (
+    <>
+      {dd.kpis?.length > 0 && (
+        <div style={{ display:"grid", gridTemplateColumns:`repeat(auto-fit, minmax(180px, 1fr))`, gap:13, marginBottom:18 }}>
+          {dd.kpis.map((kpi,i) => (
+            <div key={i} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:15, padding:"16px 18px", boxShadow:shadowSm }}>
+              <div style={{ fontSize:10.5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3, marginBottom:8 }}>{kpi.label}</div>
+              <div style={{ display:"flex", alignItems:"baseline", gap:7 }}>
+                <div style={{ fontSize:22, fontWeight:700, letterSpacing:"-0.4px", color:kpi.color||C.text }}>{kpi.value}</div>
+                <div style={{ fontSize:14, fontWeight:700, color:trendColor(kpi.trend) }}>{trendIcon(kpi.trend)}</div>
+              </div>
+            </div>
+          ))}
+        </div>
+      )}
+      {dd.charts?.length > 0 && (
+        <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(360px, 1fr))", gap:15, marginBottom:18 }}>
+          {dd.charts.map((chart,i) => {
+            if (chart.type === "pie" || chart.type === "donut")
+              return <DonutChart key={i} title={chart.title} data={chart.data}/>;
+            if (chart.type === "line")
+              return <TrendChart key={i} title={chart.title} series={chart.data}/>;
+            return <StaticBar key={i} chart={chart}/>;
+          })}
+        </div>
+      )}
+      <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(250px, 1fr))", gap:13 }}>
+        {dd.insights?.length > 0 && (
+          <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:15, padding:18, boxShadow:shadowSm }}>
+            <div style={{ fontWeight:600, fontSize:13, color:C.text, marginBottom:12 }}>💡 Key Insights</div>
+            {dd.insights.map((ins,i) => (
+              <div key={i} style={{ display:"flex", gap:7, alignItems:"flex-start", marginBottom:8 }}>
+                <div style={{ width:5, height:5, borderRadius:"50%", background:C.blue, flexShrink:0, marginTop:6 }}/>
+                <span style={{ fontSize:12.5, color:C.text2, lineHeight:1.5 }}>{ins}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {dd.warnings?.length > 0 && (
+          <div style={{ background:"#fff8e8", border:"1px solid #ffe4a0", borderRadius:15, padding:18, boxShadow:shadowSm }}>
+            <div style={{ fontWeight:600, fontSize:13, color:"#996600", marginBottom:12 }}>⚠️ Warnings</div>
+            {dd.warnings.map((w,i) => (
+              <div key={i} style={{ display:"flex", gap:7, alignItems:"flex-start", marginBottom:8 }}>
+                <div style={{ width:5, height:5, borderRadius:"50%", background:C.amber, flexShrink:0, marginTop:6 }}/>
+                <span style={{ fontSize:12.5, color:"#664400", lineHeight:1.5 }}>{w}</span>
+              </div>
+            ))}
+          </div>
+        )}
+        {dd.actions?.length > 0 && (
+          <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:15, padding:18, boxShadow:shadowSm }}>
+            <div style={{ fontWeight:600, fontSize:13, color:C.text, marginBottom:12 }}>⚡ Action Items</div>
+            {dd.actions.map((a,i) => (
+              <div key={i} style={{ display:"flex", gap:7, alignItems:"flex-start", marginBottom:8 }}>
+                <div style={{ fontSize:10, fontWeight:700, color:C.blue, background:C.blueBg, borderRadius:18, width:18, height:18, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>{i+1}</div>
+                <span style={{ fontSize:12.5, color:C.text2, lineHeight:1.5 }}>{a}</span>
+              </div>
+            ))}
+          </div>
+        )}
+      </div>
+    </>
   );
 }
 
@@ -140,18 +632,27 @@ function renderMarkdown(text: string) {
   });
 }
 
+// ═══════════════ PAGE ═══════════════
 export default function DashboardViewPage() {
-  const [data, setData] = useState<Payload | null>(null);
-  const [tab,  setTab]  = useState<"visual"|"narrative">("visual");
+  const [payload, setPayload] = useState<Payload | null>(null);
+  const [user, setUser]       = useState<User | null>(null);
+  const [authReady, setAuthReady] = useState(false);
+  const [tab, setTab]         = useState<"explore"|"report"|"narrative">("report");
 
   useEffect(() => {
     try {
       const raw = sessionStorage.getItem("dashwise-analysis");
-      if (raw) setData(JSON.parse(raw));
+      if (raw) {
+        const p = JSON.parse(raw) as Payload;
+        setPayload(p);
+        if (p.cubeFiles?.length && p.folderId) setTab("explore");
+      }
     } catch {}
+    const unsub = onAuthStateChanged(auth, u => { setUser(u); setAuthReady(true); });
+    return unsub;
   }, []);
 
-  if (!data) return (
+  if (!payload) return (
     <div style={{ minHeight:"100vh", background:C.bg, display:"flex", alignItems:"center", justifyContent:"center", fontFamily:"-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" }}>
       <div style={{ textAlign:"center" }}>
         <div style={{ fontSize:48, marginBottom:16 }}>📊</div>
@@ -159,125 +660,72 @@ export default function DashboardViewPage() {
         <p style={{ fontSize:14, color:C.text3, marginBottom:20 }}>Run an analysis from the Files page first.</p>
         <button onClick={()=>window.close()} style={{ background:C.blue, color:"#fff", border:"none", padding:"10px 22px", borderRadius:10, fontSize:14, cursor:"pointer", fontFamily:"inherit", fontWeight:600 }}>Close window</button>
       </div>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
   );
 
-  const dd = data.dashboardData || { summary:"", kpis:[], insights:[], warnings:[], actions:[], charts:[] };
-  const trendIcon  = (t:string) => t==="up" ? "↑" : t==="down" ? "↓" : "→";
-  const trendColor = (t:string) => t==="up" ? C.green : t==="down" ? C.red : C.text3;
+  const dd = payload.dashboardData || { summary:"", kpis:[], insights:[], warnings:[], actions:[], charts:[] };
+  const hasExplore = !!(payload.cubeFiles?.length && payload.folderId);
+
+  const TABS = [
+    ...(hasExplore ? [["explore","📊 Explore"]] as const : []),
+    ["report","🤖 AI Report"], ["narrative","📝 Narrative"],
+  ] as const;
 
   return (
     <div style={{ minHeight:"100vh", background:C.bg, fontFamily:"-apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif" }}>
-      {/* Sticky header */}
-      <div style={{ background:"rgba(255,255,255,0.9)", backdropFilter:"saturate(180%) blur(20px)", WebkitBackdropFilter:"saturate(180%) blur(20px)", borderBottom:`1px solid ${C.border}`, padding:"12px 24px", position:"sticky", top:0, zIndex:50 }}>
-        <div style={{ maxWidth:1100, margin:"0 auto", display:"flex", alignItems:"center", gap:14, flexWrap:"wrap" }}>
-          <div style={{ flex:1, minWidth:200 }}>
+      <div style={{ background:"rgba(255,255,255,0.9)", backdropFilter:"saturate(180%) blur(20px)", WebkitBackdropFilter:"saturate(180%) blur(20px)", borderBottom:`1px solid ${C.border}`, padding:"11px 22px", position:"sticky", top:0, zIndex:50 }}>
+        <div style={{ maxWidth:1180, margin:"0 auto", display:"flex", alignItems:"center", gap:14, flexWrap:"wrap" }}>
+          <div style={{ flex:1, minWidth:180 }}>
             <div style={{ fontSize:10, color:C.text3, textTransform:"uppercase", letterSpacing:"0.7px", fontWeight:600, marginBottom:2 }}>
-              DashWise Analysis{data.analyzedAt ? ` · ${new Date(data.analyzedAt).toLocaleDateString()}` : ""}
+              DashWise{payload.analyzedAt ? ` · analyzed ${new Date(payload.analyzedAt).toLocaleDateString()}` : ""}
             </div>
-            <h1 style={{ fontSize:19, fontWeight:700, color:C.text, letterSpacing:"-0.3px" }}>{data.bizName || "Business Dashboard"}</h1>
+            <h1 style={{ fontSize:18, fontWeight:700, color:C.text, letterSpacing:"-0.3px" }}>{payload.bizName || "Business Dashboard"}</h1>
           </div>
           <div style={{ display:"flex", background:C.bg, borderRadius:10, padding:3, border:`1px solid ${C.border}` }}>
-            {(["visual","narrative"] as const).map(t => (
-              <button key={t} onClick={()=>setTab(t)} style={{
-                padding:"7px 16px", borderRadius:8, fontSize:13, fontWeight:tab===t?600:400, fontFamily:"inherit",
-                background:tab===t?C.surface:"transparent", color:tab===t?C.text:C.text3,
-                border:"none", cursor:"pointer", boxShadow:tab===t?shadowSm:"none",
-              }}>
-                {t==="visual" ? "📊 Dashboard" : "📝 Full Report"}
-              </button>
+            {TABS.map(([k, lbl]) => (
+              <button key={k} onClick={()=>setTab(k)} style={{
+                padding:"7px 14px", borderRadius:8, fontSize:12.5, fontWeight:tab===k?600:400, fontFamily:"inherit",
+                background:tab===k?C.surface:"transparent", color:tab===k?C.text:C.text3,
+                border:"none", cursor:"pointer", boxShadow:tab===k?shadowSm:"none",
+              }}>{lbl}</button>
             ))}
           </div>
-          <button onClick={()=>window.close()} style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.text3, fontSize:13, padding:"7px 14px", borderRadius:10, cursor:"pointer", fontFamily:"inherit" }}>✕ Close</button>
+          <button onClick={()=>window.close()} style={{ background:"transparent", border:`1px solid ${C.border}`, color:C.text3, fontSize:12.5, padding:"7px 13px", borderRadius:10, cursor:"pointer", fontFamily:"inherit" }}>✕ Close</button>
         </div>
       </div>
 
-      <div style={{ maxWidth:1100, margin:"0 auto", padding:"24px 20px" }}>
-
-        {dd.summary && (
-          <div style={{ background:`linear-gradient(135deg, ${C.blue} 0%, #0058b8 100%)`, borderRadius:20, padding:"20px 24px", marginBottom:22, boxShadow:"0 6px 20px rgba(0,113,227,0.25)" }}>
-            <div style={{ fontSize:11, color:"rgba(255,255,255,0.65)", fontWeight:600, textTransform:"uppercase", letterSpacing:"0.8px", marginBottom:8 }}>Executive Summary</div>
-            <p style={{ fontSize:15, color:"#fff", lineHeight:1.6 }}>{dd.summary}</p>
+      <div style={{ maxWidth:1180, margin:"0 auto", padding:"20px 18px" }}>
+        {dd.summary && tab !== "explore" && (
+          <div style={{ background:`linear-gradient(135deg, ${C.blue} 0%, #0058b8 100%)`, borderRadius:18, padding:"18px 22px", marginBottom:20, boxShadow:"0 6px 20px rgba(0,113,227,0.25)" }}>
+            <div style={{ fontSize:10.5, color:"rgba(255,255,255,0.65)", fontWeight:600, textTransform:"uppercase", letterSpacing:"0.8px", marginBottom:7 }}>Executive Summary</div>
+            <p style={{ fontSize:14, color:"#fff", lineHeight:1.6 }}>{dd.summary}</p>
           </div>
         )}
 
-        {tab === "visual" && (
-          <>
-            {dd.kpis?.length > 0 && (
-              <div style={{ display:"grid", gridTemplateColumns:`repeat(auto-fit, minmax(190px, 1fr))`, gap:14, marginBottom:22 }}>
-                {dd.kpis.map((kpi,i) => (
-                  <div key={i} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:18, padding:"18px 20px", boxShadow:shadowSm }}>
-                    <div style={{ fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.8px", color:C.text3, marginBottom:10 }}>{kpi.label}</div>
-                    <div style={{ display:"flex", alignItems:"baseline", gap:8 }}>
-                      <div style={{ fontSize:24, fontWeight:700, letterSpacing:"-0.5px", color:kpi.color||C.text }}>{kpi.value}</div>
-                      <div style={{ fontSize:15, fontWeight:700, color:trendColor(kpi.trend) }}>{trendIcon(kpi.trend)}</div>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-
-            {dd.charts?.length > 0 && (
-              <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(380px, 1fr))", gap:16, marginBottom:22 }}>
-                {dd.charts.map((chart,i) => {
-                  if (chart.type === "bar")   return <BarChart  key={i} chart={chart}/>;
-                  if (chart.type === "line")  return <LineChart key={i} chart={chart}/>;
-                  return <PieChart key={i} chart={chart}/>;
-                })}
-              </div>
-            )}
-
-            <div style={{ display:"grid", gridTemplateColumns:"repeat(auto-fit, minmax(260px, 1fr))", gap:14 }}>
-              {dd.insights?.length > 0 && (
-                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:18, padding:20, boxShadow:shadowSm }}>
-                  <div style={{ fontWeight:600, fontSize:14, color:C.text, marginBottom:14 }}>💡 Key Insights</div>
-                  <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
-                    {dd.insights.map((ins,i) => (
-                      <div key={i} style={{ display:"flex", gap:8, alignItems:"flex-start" }}>
-                        <div style={{ width:6, height:6, borderRadius:"50%", background:C.blue, flexShrink:0, marginTop:6 }}/>
-                        <span style={{ fontSize:13, color:C.text2, lineHeight:1.5 }}>{ins}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {dd.warnings?.length > 0 && (
-                <div style={{ background:"#fff8e8", border:"1px solid #ffe4a0", borderRadius:18, padding:20, boxShadow:shadowSm }}>
-                  <div style={{ fontWeight:600, fontSize:14, color:"#996600", marginBottom:14 }}>⚠️ Warnings</div>
-                  <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
-                    {dd.warnings.map((w,i) => (
-                      <div key={i} style={{ display:"flex", gap:8, alignItems:"flex-start" }}>
-                        <div style={{ width:6, height:6, borderRadius:"50%", background:C.amber, flexShrink:0, marginTop:6 }}/>
-                        <span style={{ fontSize:13, color:"#664400", lineHeight:1.5 }}>{w}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
-              {dd.actions?.length > 0 && (
-                <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:18, padding:20, boxShadow:shadowSm }}>
-                  <div style={{ fontWeight:600, fontSize:14, color:C.text, marginBottom:14 }}>⚡ Action Items</div>
-                  <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
-                    {dd.actions.map((a,i) => (
-                      <div key={i} style={{ display:"flex", gap:8, alignItems:"flex-start" }}>
-                        <div style={{ fontSize:11, fontWeight:700, color:C.blue, background:C.blueBg, borderRadius:20, width:20, height:20, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>{i+1}</div>
-                        <span style={{ fontSize:13, color:C.text2, lineHeight:1.5 }}>{a}</span>
-                      </div>
-                    ))}
-                  </div>
-                </div>
-              )}
+        {tab === "explore" && hasExplore && (
+          !authReady ? (
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12, padding:60 }}><Spinner size={24}/></div>
+          ) : user ? (
+            <ExploreTab payload={payload} user={user}/>
+          ) : (
+            <div style={{ textAlign:"center", padding:"50px 20px" }}>
+              <div style={{ fontSize:40, marginBottom:12 }}>🔒</div>
+              <div style={{ fontSize:14, fontWeight:600, color:C.text, marginBottom:6 }}>Sign-in required</div>
+              <div style={{ fontSize:13, color:C.text3 }}>Open this dashboard from the Files page while logged in.</div>
             </div>
-          </>
+          )
         )}
 
+        {tab === "report"    && <StaticReport dd={dd}/>}
         {tab === "narrative" && (
-          <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:20, padding:"28px 32px", boxShadow:shadowSm }}>
-            <div style={{ fontWeight:700, fontSize:17, color:C.text, marginBottom:18, letterSpacing:"-0.3px" }}>Full Analysis Report</div>
-            {renderMarkdown(data.narrative || "No narrative available.")}
+          <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:18, padding:"26px 30px", boxShadow:shadowSm }}>
+            <div style={{ fontWeight:700, fontSize:16, color:C.text, marginBottom:16, letterSpacing:"-0.3px" }}>Full Analysis Report</div>
+            {renderMarkdown(payload.narrative || "No narrative available.")}
           </div>
         )}
       </div>
+      <style>{`@keyframes spin{to{transform:rotate(360deg)}}`}</style>
     </div>
   );
 }
