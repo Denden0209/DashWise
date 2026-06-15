@@ -48,7 +48,7 @@ Rules:
 
     const response = await claude.messages.create({
       model:      "claude-sonnet-4-6",
-      max_tokens: 3500,
+      max_tokens: 2800,
       system:     systemPrompt,
       messages:   [{ role: "user", content: `Dataset file: ${fileName}\n\n${schemaText.slice(0, 16000)}` }],
     });

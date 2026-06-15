@@ -21,7 +21,7 @@ export async function POST(req: NextRequest) {
     };
 
     const fileContext = files.map((f: { fileName: string; fileType: string; content: string; sheets?: string[] }) =>
-      `FILE: ${f.fileName} (${f.fileType.toUpperCase()}${f.sheets?.length ? `, ${f.sheets.length} sheets` : ""})\n${f.content.slice(0, 12000)}`
+      `FILE: ${f.fileName} (${f.fileType.toUpperCase()}${f.sheets?.length ? `, ${f.sheets.length} sheets` : ""})\n${f.content.slice(0, 40000)}`
     ).join("\n\n---\n\n");
 
     const systemPrompt = `You are an expert business analyst. Analyze the uploaded business data for ${bizName || "this business"}.

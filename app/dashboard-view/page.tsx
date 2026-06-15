@@ -702,8 +702,19 @@ function DeveloperTab({ payload, user }: { payload: Payload; user: User }) {
         method:"POST", headers:{ "Content-Type":"application/json" },
         body: JSON.stringify({ schemaText: schemaToText(model), fileName: model.fileName, shape: model.shape }),
       });
-      const data = await res.json() as { success?:boolean; guide?:DevGuide; error?:string };
-      if (!res.ok || !data.success) throw new Error(data.error || `Server error (${res.status})`);
+      // Read as text first — a Vercel timeout or crash returns HTML/plain text,
+      // not JSON, so res.json() would throw "Unexpected token 'A'...".
+      const rawText = await res.text();
+      let data: { success?:boolean; guide?:DevGuide; error?:string } | null = null;
+      try { data = JSON.parse(rawText); } catch { data = null; }
+
+      if (!res.ok || !data) {
+        if (res.status === 504 || /timeout|timed out/i.test(rawText)) {
+          throw new Error("The guide took too long to generate (server timeout). This usually means the Vercel plan's 10s limit was hit — try again, or upgrade to Vercel Pro for longer limits.");
+        }
+        throw new Error((data && data.error) || `Server error (${res.status}). Please try again.`);
+      }
+      if (!data.success) throw new Error(data.error || "Could not generate the guide. Try again.");
       setGuide(data.guide || null);
     } catch (err) {
       setGuideErr(err instanceof Error ? err.message : "Failed to generate guide.");

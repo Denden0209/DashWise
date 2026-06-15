@@ -212,7 +212,7 @@ export default function FilesPage() {
         body: JSON.stringify({
           files: ready.map(f => ({
             fileName: f.name, fileType: f.type,
-            content:  (f.parsedContent || "").slice(0, 12000),
+            content:  (f.parsedContent || "").slice(0, 40000),
             sheets:   f.sheets || [],
           })),
           businessType: profile?.bizType || "retail",

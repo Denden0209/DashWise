@@ -5,7 +5,8 @@
 // interactive dashboard (tabular files with a date column only).
 
 import { buildDataCube, DataCube, buildJoinLookups, enrichFactRows, SheetData } from "@/lib/dataCube";
-import { buildSchemaModel, schemaToText, SchemaModel } from "@/lib/schemaProfiler";
+import { buildSchemaModel, SchemaModel } from "@/lib/schemaProfiler";
+import { buildSmartSummary } from "@/lib/kpiSummary";
 
 export type ParseResult = {
   content:    string;     // smart summary text sent to Claude / stored in Firestore
@@ -195,35 +196,6 @@ function summarizeSheet(sheetName: string, aoa: unknown[][]): string {
   return lines.join("\n") + "\n";
 }
 
-// ── Cross-sheet relationship detection ─────────────────────
-function detectRelationships(
-  sheetData: Record<string, { headers: string[]; uniqueKeys: Record<string, Set<unknown>> }>
-): string {
-  const relationships: string[] = [];
-  const sheetNames = Object.keys(sheetData);
-  for (let i = 0; i < sheetNames.length; i++) {
-    for (let j = i + 1; j < sheetNames.length; j++) {
-      const s1 = sheetNames[i], s2 = sheetNames[j];
-      sheetData[s1].headers.forEach(col1 => {
-        if (!/key|id/i.test(col1)) return;
-        const col2 = sheetData[s2].headers.find(c => c.toLowerCase() === col1.toLowerCase());
-        if (!col2) return;
-        const keys1 = sheetData[s1].uniqueKeys[col1];
-        const keys2 = sheetData[s2].uniqueKeys[col2];
-        if (!keys1 || !keys2 || keys1.size === 0 || keys2.size === 0) return;
-        let overlap = 0;
-        keys1.forEach(k => { if (keys2.has(k)) overlap++; });
-        const pct = (overlap / keys1.size) * 100;
-        if (overlap > 0 && pct >= 70) {
-          relationships.push(`  ${s1}.${col1} → ${s2}.${col2} (${pct.toFixed(0)}% match — joinable)`);
-          if (pct < 100) relationships.push(`    ⚠ ${keys1.size - overlap} keys in ${s1} have no match in ${s2}`);
-        }
-      });
-    }
-  }
-  return relationships.length ? "\nDETECTED RELATIONSHIPS (joinable columns):\n" + relationships.join("\n") : "";
-}
-
 // Build cube from the best candidate sheet, ENRICHED with dimension labels
 // pulled in via foreign-key joins (Option A). The schema model tells us which
 // sheet is the fact table and how it joins to dimension tables.
@@ -288,16 +260,11 @@ async function parseExcel(file: File): Promise<ParseResult> {
   const parts: string[] = [];
   const sheetAoAs: { name: string; aoa: unknown[][] }[] = [];
   let totalRows = 0;
-  const sheetMeta: Record<string, { headers: string[]; uniqueKeys: Record<string, Set<unknown>> }> = {};
-
-  parts.push(`FILE: ${file.name}`);
-  parts.push(`Sheets: ${sheets.join(", ")}`);
-  parts.push(`Total sheets: ${wb.SheetNames.length}${wb.SheetNames.length > MAX_SHEETS ? ` (showing first ${MAX_SHEETS})` : ""}\n`);
 
   for (const sheetName of sheets) {
     const ws  = wb.Sheets[sheetName];
     const aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { header:1, defval:"", raw:true });
-    if (aoa.length === 0) { parts.push(`=== SHEET: ${sheetName} ===\n(empty)\n`); continue; }
+    if (aoa.length === 0) continue;
     sheetAoAs.push({ name: sheetName, aoa });
 
     const headerIdx = detectHeaderRow(aoa);
@@ -306,18 +273,9 @@ async function parseExcel(file: File): Promise<ParseResult> {
       !row.every(c => c === null || c === undefined || c === "") && !isSummaryRow(row, headers)
     );
     totalRows += dataRows.length;
-
-    const uniqueKeys: Record<string, Set<unknown>> = {};
-    headers.forEach((h, col) => {
-      if (/key|id/i.test(h)) {
-        uniqueKeys[h] = new Set(dataRows.map(r => r[col]).filter(v => v !== null && v !== undefined && v !== ""));
-      }
-    });
-    sheetMeta[sheetName] = { headers, uniqueKeys };
-    parts.push(summarizeSheet(sheetName, aoa));
   }
 
-  // ── Build the schema model (powers joins, Developer tab, richer analysis) ──
+  // ── Build the schema model (powers joins, Developer tab, smart summary) ──
   const schemaSheets = sheetAoAs.map(s => {
     const headerIdx = detectHeaderRow(s.aoa);
     const headers   = (s.aoa[headerIdx] as unknown[]).map(h => String(h || "").trim());
@@ -330,12 +288,17 @@ async function parseExcel(file: File): Promise<ParseResult> {
   try { schema = buildSchemaModel(file.name, schemaSheets); }
   catch (e) { console.warn("[schema] build failed", e); }
 
-  const relationships = detectRelationships(sheetMeta);
-  if (relationships) parts.push(relationships);
-
-  // Option B: include the full multi-sheet schema so analysis sees EVERY table,
-  // not just the first 12K characters of concatenated rows.
-  if (schema) parts.push("\n" + schemaToText(schema));
+  // ── Smart multi-tab summary: importance-ranked, budget-aware, EVERY sheet
+  //    represented with headline KPIs (Phase 1). Replaces the old per-sheet
+  //    dump that truncated later tabs. ──
+  if (schema) {
+    parts.push(buildSmartSummary(file.name, schema, schemaSheets, 60_000));
+  } else {
+    // Fallback to the legacy per-sheet summarizer if schema build failed
+    parts.push(`FILE: ${file.name}`);
+    parts.push(`Sheets: ${sheets.join(", ")}\n`);
+    for (const s of sheetAoAs) parts.push(summarizeSheet(s.name, s.aoa));
+  }
 
   const cube = buildBestCube(file.name, sheetAoAs, schema);
   if (cube) parts.push(`\n[INTERACTIVE DASHBOARD: enabled from sheet "${cube.sheetName}" — ${cube.sourceRowCount.toLocaleString()} rows, ${cube.dateRange.min} to ${cube.dateRange.max}, dimensions: ${cube.dimensions.map(d=>d.name).join(", ")}]`);
@@ -380,8 +343,12 @@ async function parseCSV(file: File): Promise<ParseResult> {
     return { content:text, sheets:[], rowCount:aoa.length-1, fileType:"csv", fileName:file.name,
              chars:text.length, truncated:false, summarized:false, cube, schema };
   }
-  let summary = summarizeSheet(file.name, aoa);
-  if (schema) summary += "\n" + schemaToText(schema);
+  let summary: string;
+  if (schema) {
+    summary = buildSmartSummary(file.name, schema, [{ name: file.name, headers, rows: dataRows }], 60_000);
+  } else {
+    summary = summarizeSheet(file.name, aoa);
+  }
   if (cube) summary += `\n[INTERACTIVE DASHBOARD: enabled — ${cube.sourceRowCount.toLocaleString()} rows, ${cube.dateRange.min} to ${cube.dateRange.max}]`;
   return { content:summary, sheets:[], rowCount:aoa.length-1, fileType:"csv", fileName:file.name,
            chars:summary.length, truncated:false, summarized:true, cube, schema };
