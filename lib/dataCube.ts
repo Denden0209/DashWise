@@ -452,3 +452,96 @@ export function formatMeasureValue(v: number, measure: string, cube: DataCube, i
     : v % 1 === 0 ? v.toLocaleString() : v.toFixed(2);
   return money ? `$${num}` : num;
 }
+
+// ── Multi-sheet join enrichment (Option A) ─────────────────
+// Given a fact sheet and the other sheets, look up dimension labels via
+// foreign keys and inject them as extra columns BEFORE cube build, so the
+// cube gains real business dimensions (Category, Product Name) not just keys.
+
+export type SheetData = { name: string; headers: string[]; rows: unknown[][] };
+
+type LookupSpec = {
+  factKeyIdx:   number;        // column index of the FK in the fact sheet
+  dimByKey:     Map<string, string>;  // dim key value -> label value
+  newColName:   string;        // e.g. "Category" or "Product Name"
+};
+
+// Choose which descriptive columns to pull from a dimension table.
+// Prefer low-cardinality category-like text columns (good for filtering).
+function pickDimLabelColumns(dim: SheetData, keyColName: string): number[] {
+  const out: { idx: number; score: number }[] = [];
+  dim.headers.forEach((h, idx) => {
+    if (!h || h === keyColName) return;
+    if (/key$|id$|sk$|code$/i.test(h.trim())) return;          // skip other keys
+    // sample cardinality + numeric share
+    let nonBlank = 0, numeric = 0; const uniq = new Set<string>();
+    const step = dim.rows.length > 5000 ? Math.ceil(dim.rows.length / 5000) : 1;
+    for (let i = 0; i < dim.rows.length; i += step) {
+      const v = dim.rows[i][idx];
+      if (v === null || v === undefined || v === "") continue;
+      nonBlank++; if (isNumericValue(v)) numeric++;
+      if (uniq.size <= 200) uniq.add(String(v).trim());
+    }
+    if (nonBlank === 0) return;
+    const numericPct = numeric / nonBlank;
+    if (numericPct > 0.6) return;                               // skip numeric/measure cols
+    if (uniq.size < 2 || uniq.size > 50) return;                // good dimension cardinality only
+    const nameHint = /name|category|subcategory|type|class|group|segment|status|color|size|brand|region|country|department|title/i.test(h) ? 2 : 0;
+    out.push({ idx, score: nameHint + (uniq.size <= 25 ? 1 : 0) });
+  });
+  return out.sort((a, b) => b.score - a.score).slice(0, 2).map(x => x.idx);  // up to 2 labels per dim
+}
+
+// Build lookup specs from fact → each related dimension sheet.
+export function buildJoinLookups(
+  fact: SheetData,
+  others: SheetData[],
+  relationships: { fromColumn: string; toTable: string; toColumn: string }[],
+): LookupSpec[] {
+  const specs: LookupSpec[] = [];
+  for (const rel of relationships) {
+    const dim = others.find(s => s.name === rel.toTable);
+    if (!dim) continue;
+    const factKeyIdx = fact.headers.findIndex(h => h.toLowerCase() === rel.fromColumn.toLowerCase());
+    const dimKeyIdx  = dim.headers.findIndex(h => h.toLowerCase() === rel.toColumn.toLowerCase());
+    if (factKeyIdx < 0 || dimKeyIdx < 0) continue;
+
+    const labelIdxs = pickDimLabelColumns(dim, dim.headers[dimKeyIdx]);
+    if (labelIdxs.length === 0) continue;
+
+    for (const labelIdx of labelIdxs) {
+      const dimByKey = new Map<string, string>();
+      for (const r of dim.rows) {
+        const k = r[dimKeyIdx];
+        if (k === null || k === undefined || k === "") continue;
+        const lbl = r[labelIdx];
+        dimByKey.set(String(k).trim(), lbl === null || lbl === undefined || lbl === "" ? "(blank)" : String(lbl).trim());
+      }
+      if (dimByKey.size > 0) {
+        // Disambiguate column name if it collides with a fact column
+        let newColName = dim.headers[labelIdx];
+        if (fact.headers.includes(newColName)) newColName = `${dim.name.replace(/_data$|_dim$/i,"")}.${newColName}`;
+        specs.push({ factKeyIdx, dimByKey, newColName });
+      }
+    }
+  }
+  return specs;
+}
+
+// Apply lookups: returns enriched headers + rows (fact rows + appended label columns)
+export function enrichFactRows(
+  fact: SheetData,
+  lookups: LookupSpec[],
+): { headers: string[]; rows: unknown[][] } {
+  if (lookups.length === 0) return { headers: fact.headers, rows: fact.rows };
+  const headers = [...fact.headers, ...lookups.map(l => l.newColName)];
+  const rows = fact.rows.map(r => {
+    const extra = lookups.map(l => {
+      const k = r[l.factKeyIdx];
+      if (k === null || k === undefined || k === "") return "(blank)";
+      return l.dimByKey.get(String(k).trim()) ?? "(unmatched)";
+    });
+    return [...r, ...extra];
+  });
+  return { headers, rows };
+}

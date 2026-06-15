@@ -1,21 +1,24 @@
 "use client";
 // Interactive dashboard — opened in a NEW WINDOW from the Files page.
-// Three tabs:
-//   📊 Explore   — dynamic: filter sidebar, time intelligence, YoY, Agent (needs a data cube)
-//   🤖 AI Report — Claude's static analysis (kpis/charts JSON)
-//   📝 Narrative — full markdown report
+// Four tabs:
+//   📊 Explore    — dynamic: filter sidebar, time intelligence, YoY, Agent (needs a data cube)
+//   🤖 AI Report  — Claude's static analysis (kpis/charts JSON)
+//   📝 Narrative  — full markdown report
+//   🛠️ Developer  — schema model + build guidance (star/snowflake, slicing, cleaning, questions)
 // The Explore tab computes EVERY number locally from the cube — nothing is AI-generated.
 
 import { useEffect, useMemo, useState, useCallback } from "react";
 import { onAuthStateChanged, User } from "firebase/auth";
 import { auth } from "@/lib/firebase";
-import { getFileCube } from "@/lib/db";
+import { getFileCube, getFileSchema } from "@/lib/db";
 import {
   DataCube, Filters, DateWindow, Grain, MeasureSpec,
   filterRows, computeMeasure, seriesByGrain, byDimension,
   yoyOverlay, periodComparison, timeCapabilities, presetWindow,
   formatMeasureValue,
 } from "@/lib/dataCube";
+import type { SchemaModel, TableInfo, ColumnInfo } from "@/lib/schemaProfiler";
+import { schemaToText } from "@/lib/schemaProfiler";
 
 const C = {
   bg:"#f5f5f7", surface:"#ffffff", border:"#e5e5ea", blue:"#0071e3",
@@ -36,6 +39,7 @@ type Payload = {
   dashboardData:DashboardData; narrative:string; bizName:string; mode:string;
   analyzedAt?:string; folderId?:string;
   cubeFiles?: { id:string; name:string }[];
+  schemaFiles?: { id:string; name:string }[];
 };
 
 // ── Agent view spec (validated server-side) ────────────────
@@ -619,6 +623,328 @@ function StaticReport({ dd }: { dd: DashboardData }) {
   );
 }
 
+
+// ═══════════════ DEVELOPER TAB ═══════════════
+type DevGuide = {
+  verdict: string;
+  targetSchema: {
+    approach: string; rationale: string;
+    factTables: { table:string; grain:string; measures:string[]; foreignKeys:string[] }[];
+    dimensionTables: { table:string; key:string; attributes:string[]; scd:string }[];
+  };
+  slicing: { table:string; why:string; strategy:string }[];
+  snowflakeNotes: string;
+  questions: string[];
+  cleaning: { table:string; column:string; issue:string; fix:string }[];
+  joins: { join:string; cardinality:string; note:string }[];
+  buildSteps: string[];
+};
+
+const ROLE_COLOR: Record<string,{bg:string;fg:string}> = {
+  fact:      { bg:"#e8f0fe", fg:"#0071e3" },
+  dimension: { bg:"#f3e8fd", fg:"#af52de" },
+  bridge:    { bg:"#fff3e0", fg:"#ff9f0a" },
+  reference: { bg:"#e1f5ee", fg:"#1D9E75" },
+  flat:      { bg:"#f0faf4", fg:"#34c759" },
+  unknown:   { bg:"#f5f5f7", fg:"#86868b" },
+};
+const ROLE_DOT: Record<ColumnInfo["role"],string> = {
+  key:"#af52de", date:"#0071e3", measure:"#34c759", dimension:"#ff9f0a", text:"#86868b", flag:"#5ac8fa",
+};
+
+function ShapeBadge({ shape }: { shape:string }) {
+  const map: Record<string,{label:string;color:string;desc:string}> = {
+    star:          { label:"⭐ Star Schema", color:"#0071e3", desc:"One fact table surrounded by dimension tables — ideal for BI" },
+    snowflake:     { label:"❄️ Snowflake Schema", color:"#5ac8fa", desc:"Dimensions normalized into sub-dimensions" },
+    flat:          { label:"▦ Flat / Wide Table", color:"#34c759", desc:"Single denormalized table with everything in one place" },
+    "multi-fact":  { label:"✦ Multi-Fact", color:"#af52de", desc:"Multiple fact tables — a constellation/galaxy schema" },
+    "single-table":{ label:"▢ Single Table", color:"#86868b", desc:"One table — model as a flat fact or one-big-table" },
+    disconnected:  { label:"⚠ Disconnected Tables", color:"#ff9f0a", desc:"No reliable joins detected between tables" },
+  };
+  const m = map[shape] || map.disconnected;
+  return (
+    <div style={{ display:"inline-flex", flexDirection:"column", gap:3 }}>
+      <span style={{ fontSize:14, fontWeight:700, color:m.color }}>{m.label}</span>
+      <span style={{ fontSize:11.5, color:C.text3 }}>{m.desc}</span>
+    </div>
+  );
+}
+
+function DeveloperTab({ payload, user }: { payload: Payload; user: User }) {
+  const schemaFiles = payload.schemaFiles || [];
+  const [fileId, setFileId]     = useState(schemaFiles[0]?.id || "");
+  const [model, setModel]       = useState<SchemaModel | null>(null);
+  const [loading, setLoading]   = useState(true);
+  const [loadErr, setLoadErr]   = useState("");
+  const [guide, setGuide]       = useState<DevGuide | null>(null);
+  const [guideLoading, setGuideLoading] = useState(false);
+  const [guideErr, setGuideErr] = useState("");
+  const [openTable, setOpenTable] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!fileId || !payload.folderId) { setLoading(false); return; }
+    setLoading(true); setLoadErr(""); setModel(null); setGuide(null);
+    getFileSchema<SchemaModel>(user.uid, payload.folderId, fileId)
+      .then(m => {
+        if (!m) { setLoadErr("No schema model found for this file. Re-upload it to enable the Developer tab."); return; }
+        setModel(m);
+        setOpenTable(m.factTables[0] || m.tables[0]?.name || null);
+      })
+      .catch(() => setLoadErr("Failed to load schema. Reopen the dashboard."))
+      .finally(() => setLoading(false));
+  }, [fileId, payload.folderId, user.uid]);
+
+  async function generateGuide() {
+    if (!model || guideLoading) return;
+    setGuideLoading(true); setGuideErr("");
+    try {
+      const res  = await fetch("/api/dev-guide", {
+        method:"POST", headers:{ "Content-Type":"application/json" },
+        body: JSON.stringify({ schemaText: schemaToText(model), fileName: model.fileName, shape: model.shape }),
+      });
+      const data = await res.json() as { success?:boolean; guide?:DevGuide; error?:string };
+      if (!res.ok || !data.success) throw new Error(data.error || `Server error (${res.status})`);
+      setGuide(data.guide || null);
+    } catch (err) {
+      setGuideErr(err instanceof Error ? err.message : "Failed to generate guide.");
+    } finally { setGuideLoading(false); }
+  }
+
+  if (loading) return <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12, padding:60 }}><Spinner size={24}/><span style={{ fontSize:13, color:C.text3 }}>Loading schema...</span></div>;
+  if (loadErr || !model) return (
+    <div style={{ textAlign:"center", padding:"50px 20px" }}>
+      <div style={{ fontSize:40, marginBottom:12 }}>🛠️</div>
+      <div style={{ fontSize:14, fontWeight:600, color:C.text, marginBottom:6 }}>Developer view unavailable</div>
+      <div style={{ fontSize:13, color:C.text3, maxWidth:420, margin:"0 auto" }}>{loadErr || "No schema model found."}</div>
+    </div>
+  );
+
+  const sectionTitle = (t:string) => (
+    <div style={{ fontSize:13, fontWeight:700, color:C.text, margin:"22px 0 12px", letterSpacing:"-0.2px" }}>{t}</div>
+  );
+
+  return (
+    <div style={{ maxWidth:980, margin:"0 auto" }}>
+
+      {/* File switcher */}
+      {schemaFiles.length > 1 && (
+        <div style={{ marginBottom:16, display:"flex", alignItems:"center", gap:10 }}>
+          <span style={{ fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3 }}>Dataset:</span>
+          <select value={fileId} onChange={e=>setFileId(e.target.value)} style={{ fontSize:13, padding:"7px 10px", borderRadius:8, border:`1px solid ${C.border}`, background:C.surface, color:C.text, cursor:"pointer" }}>
+            {schemaFiles.map(f => <option key={f.id} value={f.id}>{f.name}</option>)}
+          </select>
+        </div>
+      )}
+
+      {/* Schema overview banner */}
+      <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:16, padding:"20px 22px", boxShadow:shadowSm, marginBottom:18 }}>
+        <div style={{ display:"flex", alignItems:"flex-start", justifyContent:"space-between", gap:16, flexWrap:"wrap" }}>
+          <div>
+            <div style={{ fontSize:10.5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3, marginBottom:6 }}>Detected Schema Shape</div>
+            <ShapeBadge shape={model.shape}/>
+          </div>
+          <div style={{ display:"flex", gap:20 }}>
+            <div><div style={{ fontSize:21, fontWeight:700, color:C.text }}>{model.tables.length}</div><div style={{ fontSize:10.5, color:C.text3 }}>tables</div></div>
+            <div><div style={{ fontSize:21, fontWeight:700, color:C.text }}>{model.totalRows.toLocaleString()}</div><div style={{ fontSize:10.5, color:C.text3 }}>total rows</div></div>
+            <div><div style={{ fontSize:21, fontWeight:700, color:"#0071e3" }}>{model.factTables.length}</div><div style={{ fontSize:10.5, color:C.text3 }}>fact</div></div>
+            <div><div style={{ fontSize:21, fontWeight:700, color:"#af52de" }}>{model.dimensionTables.length}</div><div style={{ fontSize:10.5, color:C.text3 }}>dimension</div></div>
+          </div>
+        </div>
+      </div>
+
+      {/* Relationship map */}
+      {model.relationships.length > 0 && (
+        <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:14, padding:"16px 18px", boxShadow:shadowSm, marginBottom:18 }}>
+          <div style={{ fontSize:12, fontWeight:700, color:C.text, marginBottom:12 }}>🔗 Detected Join Graph</div>
+          <div style={{ display:"flex", flexDirection:"column", gap:7 }}>
+            {model.relationships.map((r,i) => (
+              <div key={i} style={{ display:"flex", alignItems:"center", gap:8, flexWrap:"wrap", fontSize:12, fontFamily:"monospace" }}>
+                <span style={{ background:"#e8f0fe", color:"#0071e3", padding:"3px 8px", borderRadius:6, fontWeight:600 }}>{r.fromTable}.{r.fromColumn}</span>
+                <span style={{ color:C.text3 }}>→</span>
+                <span style={{ background:"#f3e8fd", color:"#af52de", padding:"3px 8px", borderRadius:6, fontWeight:600 }}>{r.toTable}.{r.toColumn}</span>
+                <span style={{ fontSize:10.5, color:C.text3, fontFamily:"inherit" }}>{r.cardinality} · {r.matchPct}% match{r.orphans>0?` · ${r.orphans} orphans`:""}</span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* Per-table profile (expandable) */}
+      {sectionTitle("Tables & Columns")}
+      <div style={{ display:"flex", flexDirection:"column", gap:10 }}>
+        {model.tables.map(t => {
+          const rc = ROLE_COLOR[t.role] || ROLE_COLOR.unknown;
+          const isOpen = openTable === t.name;
+          const qColor = t.qualityScore >= 80 ? "#34c759" : t.qualityScore >= 55 ? "#ff9f0a" : "#ff3b30";
+          return (
+            <div key={t.name} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:12, boxShadow:shadowSm, overflow:"hidden" }}>
+              <button onClick={()=>setOpenTable(isOpen ? null : t.name)} style={{ width:"100%", display:"flex", alignItems:"center", gap:12, padding:"14px 16px", background:"none", border:"none", cursor:"pointer", textAlign:"left" }}>
+                <span style={{ fontSize:11, fontWeight:700, padding:"3px 10px", borderRadius:20, background:rc.bg, color:rc.fg, textTransform:"uppercase", letterSpacing:"0.5px" }}>{t.role}</span>
+                <div style={{ flex:1, minWidth:0 }}>
+                  <div style={{ fontSize:14, fontWeight:700, color:C.text }}>{t.name}</div>
+                  <div style={{ fontSize:11.5, color:C.text3 }}>{t.grain} · {t.rowCount.toLocaleString()} rows × {t.colCount} cols</div>
+                </div>
+                <div style={{ textAlign:"right" }}>
+                  <div style={{ fontSize:13, fontWeight:700, color:qColor }}>{t.qualityScore}<span style={{ fontSize:10, color:C.text3 }}>/100</span></div>
+                  <div style={{ fontSize:10, color:C.text3 }}>quality</div>
+                </div>
+                <span style={{ fontSize:13, color:C.text3, transform:isOpen?"rotate(90deg)":"none", transition:"transform .2s" }}>▸</span>
+              </button>
+              {isOpen && (
+                <div style={{ borderTop:`1px solid ${C.border}`, padding:"4px 0" }}>
+                  {t.columns.map((c,i) => (
+                    <div key={i} style={{ display:"flex", alignItems:"flex-start", gap:10, padding:"9px 16px", borderBottom: i<t.columns.length-1?`1px solid #f7f7f9`:"none" }}>
+                      <span style={{ width:8, height:8, borderRadius:"50%", background:ROLE_DOT[c.role], flexShrink:0, marginTop:4 }} title={c.role}/>
+                      <div style={{ flex:1, minWidth:0 }}>
+                        <div style={{ display:"flex", alignItems:"baseline", gap:8, flexWrap:"wrap" }}>
+                          <span style={{ fontSize:12.5, fontWeight:600, color:C.text, fontFamily:"monospace" }}>{c.name}</span>
+                          <span style={{ fontSize:10.5, color:C.text3 }}>{c.role} · {c.dataType}</span>
+                          {(c.role==="key"||c.role==="dimension") && <span style={{ fontSize:10.5, color:C.text3 }}>· {c.unique.toLocaleString()} distinct</span>}
+                          {c.role==="measure" && c.min!==undefined && <span style={{ fontSize:10.5, color:C.text3 }}>· {c.min}..{c.max}</span>}
+                          {c.nullPct>=5 && <span style={{ fontSize:10.5, color: c.nullPct>=30?"#ff3b30":"#ff9f0a" }}>· {c.nullPct}% null</span>}
+                        </div>
+                        {c.quality.length > 0 && (
+                          <div style={{ fontSize:10.5, color:"#996600", marginTop:3 }}>⚠ {c.quality.join(" · ")}</div>
+                        )}
+                        {c.sample.length > 0 && (
+                          <div style={{ fontSize:10.5, color:C.text3, marginTop:2, fontFamily:"monospace", overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>
+                            e.g. {c.sample.slice(0,4).join(", ")}
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      {/* AI build guidance */}
+      {sectionTitle("Build Guidance for Developers")}
+      {!guide && !guideLoading && (
+        <div style={{ background:`linear-gradient(135deg, #1d1d1f 0%, #3a3a3c 100%)`, borderRadius:16, padding:"22px 24px" }}>
+          <div style={{ fontSize:15, fontWeight:700, color:"#fff", marginBottom:6 }}>Generate a build plan from this schema</div>
+          <div style={{ fontSize:12.5, color:"rgba(255,255,255,0.7)", lineHeight:1.6, marginBottom:16, maxWidth:560 }}>
+            Get star/snowflake recommendations, table slicing strategy, a data-cleaning checklist, the join map, analytical questions this data can answer, and ordered build steps — written for a developer doing the work manually.
+          </div>
+          {guideErr && <div style={{ background:"rgba(255,59,48,0.15)", color:"#ff9f9f", fontSize:12, padding:"9px 12px", borderRadius:9, marginBottom:14 }}>{guideErr}</div>}
+          <button onClick={generateGuide} style={{ background:"#fff", color:"#1d1d1f", border:"none", borderRadius:10, padding:"11px 22px", fontSize:13.5, fontWeight:700, cursor:"pointer" }}>
+            ⚙️ Generate developer guide
+          </button>
+        </div>
+      )}
+      {guideLoading && (
+        <div style={{ display:"flex", alignItems:"center", gap:12, padding:"24px", background:C.surface, border:`1px solid ${C.border}`, borderRadius:14 }}>
+          <Spinner/><span style={{ fontSize:13, color:C.text3 }}>Analyzing schema and writing build guidance...</span>
+        </div>
+      )}
+      {guide && <GuideView guide={guide}/>}
+
+      <div style={{ fontSize:10.5, color:C.text3, textAlign:"center", padding:"16px 0" }}>
+        Schema profiled locally from your data. Build guidance generated by AI from the schema metadata only — your data rows are never sent.
+      </div>
+    </div>
+  );
+}
+
+function GuideView({ guide }: { guide: DevGuide }) {
+  const card = (children: React.ReactNode, bg = C.surface) => (
+    <div style={{ background:bg, border:`1px solid ${C.border}`, borderRadius:14, padding:"18px 20px", boxShadow:shadowSm, marginBottom:14 }}>{children}</div>
+  );
+  const h = (t:string) => <div style={{ fontSize:13, fontWeight:700, color:C.text, marginBottom:12 }}>{t}</div>;
+
+  return (
+    <div>
+      {card(<>
+        <div style={{ fontSize:10.5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:"#0071e3", marginBottom:7 }}>Verdict</div>
+        <div style={{ fontSize:14, color:C.text, lineHeight:1.6 }}>{guide.verdict}</div>
+      </>)}
+
+      {card(<>
+        {h(`🏗️ Target Schema — ${guide.targetSchema.approach}`)}
+        <div style={{ fontSize:12.5, color:C.text2, lineHeight:1.65, marginBottom:14 }}>{guide.targetSchema.rationale}</div>
+        {guide.targetSchema.factTables.map((f,i) => (
+          <div key={i} style={{ background:"#e8f0fe", borderRadius:10, padding:"12px 14px", marginBottom:8 }}>
+            <div style={{ fontSize:12.5, fontWeight:700, color:"#0071e3" }}>FACT · {f.table}</div>
+            <div style={{ fontSize:11.5, color:C.text2, marginTop:3 }}>Grain: {f.grain}</div>
+            <div style={{ fontSize:11.5, color:C.text2, marginTop:3 }}>Measures: {f.measures.join(", ") || "—"}</div>
+            <div style={{ fontSize:11.5, color:C.text2, marginTop:3 }}>Foreign keys: {f.foreignKeys.join(", ") || "—"}</div>
+          </div>
+        ))}
+        {guide.targetSchema.dimensionTables.map((d,i) => (
+          <div key={i} style={{ background:"#f3e8fd", borderRadius:10, padding:"12px 14px", marginBottom:8 }}>
+            <div style={{ fontSize:12.5, fontWeight:700, color:"#af52de" }}>DIM · {d.table}</div>
+            <div style={{ fontSize:11.5, color:C.text2, marginTop:3 }}>Key: {d.key}</div>
+            <div style={{ fontSize:11.5, color:C.text2, marginTop:3 }}>Attributes: {d.attributes.join(", ") || "—"}</div>
+            {d.scd && <div style={{ fontSize:11.5, color:C.text2, marginTop:3 }}>SCD: {d.scd}</div>}
+          </div>
+        ))}
+      </>)}
+
+      {guide.snowflakeNotes && card(<>
+        {h("❄️ Snowflake vs Star — Tradeoff")}
+        <div style={{ fontSize:12.5, color:C.text2, lineHeight:1.65 }}>{guide.snowflakeNotes}</div>
+      </>)}
+
+      {guide.slicing.length > 0 && card(<>
+        {h("✂️ Large Table Slicing / Partitioning")}
+        {guide.slicing.map((s,i) => (
+          <div key={i} style={{ marginBottom:10, paddingBottom:10, borderBottom: i<guide.slicing.length-1?`1px solid #f5f5f7`:"none" }}>
+            <div style={{ fontSize:12.5, fontWeight:600, color:C.text }}>{s.table}</div>
+            <div style={{ fontSize:11.5, color:C.text3, margin:"3px 0" }}>Why: {s.why}</div>
+            <div style={{ fontSize:11.5, color:"#0071e3" }}>Strategy: {s.strategy}</div>
+          </div>
+        ))}
+      </>)}
+
+      {guide.joins.length > 0 && card(<>
+        {h("🔗 Join Implementation")}
+        {guide.joins.map((j,i) => (
+          <div key={i} style={{ marginBottom:9 }}>
+            <div style={{ fontSize:12, fontFamily:"monospace", color:C.text, background:"#f5f5f7", padding:"6px 10px", borderRadius:7 }}>{j.join}</div>
+            <div style={{ fontSize:11, color:C.text3, marginTop:3 }}>{j.cardinality} · {j.note}</div>
+          </div>
+        ))}
+      </>)}
+
+      {guide.cleaning.length > 0 && card(<>
+        {h("🧹 Data Cleaning Checklist")}
+        {guide.cleaning.map((c,i) => (
+          <div key={i} style={{ display:"flex", gap:10, marginBottom:10, paddingBottom:10, borderBottom: i<guide.cleaning.length-1?`1px solid #f5f5f7`:"none" }}>
+            <input type="checkbox" style={{ accentColor:"#34c759", marginTop:2 }}/>
+            <div style={{ flex:1 }}>
+              <div style={{ fontSize:12, fontWeight:600, color:C.text, fontFamily:"monospace" }}>{c.table}.{c.column}</div>
+              <div style={{ fontSize:11.5, color:"#996600", margin:"2px 0" }}>⚠ {c.issue}</div>
+              <div style={{ fontSize:11.5, color:"#34c759" }}>✓ Fix: {c.fix}</div>
+            </div>
+          </div>
+        ))}
+      </>)}
+
+      {guide.questions.length > 0 && card(<>
+        {h("❓ Questions This Dataset Can Answer")}
+        {guide.questions.map((q,i) => (
+          <div key={i} style={{ display:"flex", gap:8, marginBottom:7, alignItems:"flex-start" }}>
+            <span style={{ fontSize:11, fontWeight:700, color:"#0071e3", background:"#e8f0fe", borderRadius:14, minWidth:20, height:20, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>{i+1}</span>
+            <span style={{ fontSize:12.5, color:C.text2, lineHeight:1.5 }}>{q}</span>
+          </div>
+        ))}
+      </>)}
+
+      {guide.buildSteps.length > 0 && card(<>
+        {h("📋 Build Steps")}
+        {guide.buildSteps.map((s,i) => (
+          <div key={i} style={{ display:"flex", gap:10, marginBottom:9, alignItems:"flex-start" }}>
+            <span style={{ fontSize:11, fontWeight:700, color:"#fff", background:"#1d1d1f", borderRadius:"50%", minWidth:22, height:22, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>{i+1}</span>
+            <span style={{ fontSize:12.5, color:C.text2, lineHeight:1.6, paddingTop:2 }}>{s}</span>
+          </div>
+        ))}
+      </>)}
+    </div>
+  );
+}
 function renderMarkdown(text: string) {
   return text.split("\n").map((line,i) => {
     if (!line.trim()) return <div key={i} style={{ height:8 }}/>;
@@ -637,7 +963,7 @@ export default function DashboardViewPage() {
   const [payload, setPayload] = useState<Payload | null>(null);
   const [user, setUser]       = useState<User | null>(null);
   const [authReady, setAuthReady] = useState(false);
-  const [tab, setTab]         = useState<"explore"|"report"|"narrative">("report");
+  const [tab, setTab]         = useState<"explore"|"report"|"narrative"|"developer">("report");
 
   useEffect(() => {
     try {
@@ -666,10 +992,12 @@ export default function DashboardViewPage() {
 
   const dd = payload.dashboardData || { summary:"", kpis:[], insights:[], warnings:[], actions:[], charts:[] };
   const hasExplore = !!(payload.cubeFiles?.length && payload.folderId);
+  const hasDeveloper = !!(payload.schemaFiles?.length && payload.folderId);
 
   const TABS = [
     ...(hasExplore ? [["explore","📊 Explore"]] as const : []),
     ["report","🤖 AI Report"], ["narrative","📝 Narrative"],
+    ...(hasDeveloper ? [["developer","🛠️ Developer"]] as const : []),
   ] as const;
 
   return (
@@ -696,7 +1024,7 @@ export default function DashboardViewPage() {
       </div>
 
       <div style={{ maxWidth:1180, margin:"0 auto", padding:"20px 18px" }}>
-        {dd.summary && tab !== "explore" && (
+        {dd.summary && tab !== "explore" && tab !== "developer" && (
           <div style={{ background:`linear-gradient(135deg, ${C.blue} 0%, #0058b8 100%)`, borderRadius:18, padding:"18px 22px", marginBottom:20, boxShadow:"0 6px 20px rgba(0,113,227,0.25)" }}>
             <div style={{ fontSize:10.5, color:"rgba(255,255,255,0.65)", fontWeight:600, textTransform:"uppercase", letterSpacing:"0.8px", marginBottom:7 }}>Executive Summary</div>
             <p style={{ fontSize:14, color:"#fff", lineHeight:1.6 }}>{dd.summary}</p>
@@ -718,6 +1046,19 @@ export default function DashboardViewPage() {
         )}
 
         {tab === "report"    && <StaticReport dd={dd}/>}
+        {tab === "developer" && hasDeveloper && (
+          !authReady ? (
+            <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12, padding:60 }}><Spinner size={24}/></div>
+          ) : user ? (
+            <DeveloperTab payload={payload} user={user}/>
+          ) : (
+            <div style={{ textAlign:"center", padding:"50px 20px" }}>
+              <div style={{ fontSize:40, marginBottom:12 }}>🔒</div>
+              <div style={{ fontSize:14, fontWeight:600, color:C.text, marginBottom:6 }}>Sign-in required</div>
+              <div style={{ fontSize:13, color:C.text3 }}>Open this dashboard from the Files page while logged in.</div>
+            </div>
+          )
+        )}
         {tab === "narrative" && (
           <div style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:18, padding:"26px 30px", boxShadow:shadowSm }}>
             <div style={{ fontWeight:700, fontSize:16, color:C.text, marginBottom:16, letterSpacing:"-0.3px" }}>Full Analysis Report</div>

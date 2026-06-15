@@ -4,7 +4,8 @@
 // Outputs: (1) compact summary text for Claude, (2) DataCube for the
 // interactive dashboard (tabular files with a date column only).
 
-import { buildDataCube, DataCube } from "@/lib/dataCube";
+import { buildDataCube, DataCube, buildJoinLookups, enrichFactRows, SheetData } from "@/lib/dataCube";
+import { buildSchemaModel, schemaToText, SchemaModel } from "@/lib/schemaProfiler";
 
 export type ParseResult = {
   content:    string;     // smart summary text sent to Claude / stored in Firestore
@@ -15,7 +16,8 @@ export type ParseResult = {
   chars:      number;
   truncated:  boolean;
   summarized: boolean;
-  cube:       DataCube | null;  // powers the interactive dashboard (null = static only)
+  cube:       DataCube | null;     // powers the interactive dashboard (null = static only)
+  schema:     SchemaModel | null;  // powers the Developer tab + richer analysis (Option B)
 };
 
 const RAW_ROW_LIMIT     = 500;
@@ -222,25 +224,55 @@ function detectRelationships(
   return relationships.length ? "\nDETECTED RELATIONSHIPS (joinable columns):\n" + relationships.join("\n") : "";
 }
 
-// Build cube from the best candidate sheet (most data rows that yields a valid cube)
-function buildBestCube(fileName: string, sheets: { name: string; aoa: unknown[][] }[]): DataCube | null {
-  const candidates = sheets
-    .map(s => {
-      const headerIdx = detectHeaderRow(s.aoa);
-      const headers   = (s.aoa[headerIdx] as unknown[]).map(h => String(h || "").trim());
-      const dataRows  = s.aoa.slice(headerIdx + 1).filter(row =>
-        !row.every(c => c === null || c === undefined || c === "") && !isSummaryRow(row, headers)
-      );
-      return { name: s.name, headers, dataRows };
-    })
-    .sort((a, b) => b.dataRows.length - a.dataRows.length);
+// Build cube from the best candidate sheet, ENRICHED with dimension labels
+// pulled in via foreign-key joins (Option A). The schema model tells us which
+// sheet is the fact table and how it joins to dimension tables.
+function buildBestCube(
+  fileName: string,
+  sheets: { name: string; aoa: unknown[][] }[],
+  schema: SchemaModel | null,
+): DataCube | null {
+  // Materialize headers + dataRows per sheet once
+  const parsed: SheetData[] = sheets.map(s => {
+    const headerIdx = detectHeaderRow(s.aoa);
+    const headers   = (s.aoa[headerIdx] as unknown[]).map(h => String(h || "").trim());
+    const rows      = s.aoa.slice(headerIdx + 1).filter(row =>
+      !row.every(c => c === null || c === undefined || c === "") && !isSummaryRow(row, headers)
+    );
+    return { name: s.name, headers, rows };
+  });
 
-  for (const cand of candidates) {
+  // Candidate fact sheets: prefer schema-identified fact tables, then by row count
+  const factNames = new Set(schema?.factTables || []);
+  const candidates = [...parsed].sort((a, b) => {
+    const af = factNames.has(a.name) ? 1 : 0, bf = factNames.has(b.name) ? 1 : 0;
+    if (af !== bf) return bf - af;
+    return b.rows.length - a.rows.length;
+  });
+
+  for (const fact of candidates) {
     try {
-      const cube = buildDataCube(fileName, cand.name, cand.headers, cand.dataRows);
+      let useHeaders = fact.headers;
+      let useRows    = fact.rows;
+
+      // Apply joins if the schema knows this sheet's relationships
+      if (schema) {
+        const rels = schema.relationships.filter(r => r.fromTable === fact.name);
+        if (rels.length > 0) {
+          const others  = parsed.filter(p => p.name !== fact.name);
+          const lookups = buildJoinLookups(fact, others, rels);
+          if (lookups.length > 0) {
+            const enriched = enrichFactRows(fact, lookups);
+            useHeaders = enriched.headers;
+            useRows    = enriched.rows;
+          }
+        }
+      }
+
+      const cube = buildDataCube(fileName, fact.name, useHeaders, useRows);
       if (cube) return cube;
     } catch (e) {
-      console.warn("[cube] build failed for sheet", cand.name, e);
+      console.warn("[cube] build failed for sheet", fact.name, e);
     }
   }
   return null;
@@ -285,18 +317,35 @@ async function parseExcel(file: File): Promise<ParseResult> {
     parts.push(summarizeSheet(sheetName, aoa));
   }
 
+  // ── Build the schema model (powers joins, Developer tab, richer analysis) ──
+  const schemaSheets = sheetAoAs.map(s => {
+    const headerIdx = detectHeaderRow(s.aoa);
+    const headers   = (s.aoa[headerIdx] as unknown[]).map(h => String(h || "").trim());
+    const rows      = s.aoa.slice(headerIdx + 1).filter(row =>
+      !row.every(c => c === null || c === undefined || c === "") && !isSummaryRow(row, headers)
+    );
+    return { name: s.name, headers, rows };
+  });
+  let schema: SchemaModel | null = null;
+  try { schema = buildSchemaModel(file.name, schemaSheets); }
+  catch (e) { console.warn("[schema] build failed", e); }
+
   const relationships = detectRelationships(sheetMeta);
   if (relationships) parts.push(relationships);
 
-  const cube = buildBestCube(file.name, sheetAoAs);
-  if (cube) parts.push(`\n[INTERACTIVE DASHBOARD: enabled from sheet "${cube.sheetName}" — ${cube.sourceRowCount.toLocaleString()} rows, ${cube.dateRange.min} to ${cube.dateRange.max}]`);
+  // Option B: include the full multi-sheet schema so analysis sees EVERY table,
+  // not just the first 12K characters of concatenated rows.
+  if (schema) parts.push("\n" + schemaToText(schema));
+
+  const cube = buildBestCube(file.name, sheetAoAs, schema);
+  if (cube) parts.push(`\n[INTERACTIVE DASHBOARD: enabled from sheet "${cube.sheetName}" — ${cube.sourceRowCount.toLocaleString()} rows, ${cube.dateRange.min} to ${cube.dateRange.max}, dimensions: ${cube.dimensions.map(d=>d.name).join(", ")}]`);
 
   const content = parts.join("\n").trim();
   return {
     content, sheets, rowCount: totalRows,
     fileType: file.name.split(".").pop()?.toLowerCase() || "xlsx",
     fileName: file.name, chars: content.length,
-    truncated: content.length > MAX_CONTENT_CHARS, summarized: true, cube,
+    truncated: content.length > MAX_CONTENT_CHARS, summarized: true, cube, schema,
   };
 }
 
@@ -318,16 +367,24 @@ function parseCSVText(text: string): unknown[][] {
 async function parseCSV(file: File): Promise<ParseResult> {
   const text = await file.text();
   const aoa  = parseCSVText(text);
-  const cube = buildBestCube(file.name, [{ name: file.name, aoa }]);
+
+  const headers  = (aoa[0] as unknown[] || []).map(h => String(h || "").trim());
+  const dataRows = aoa.slice(1);
+  let schema: SchemaModel | null = null;
+  try { schema = buildSchemaModel(file.name, [{ name: file.name, headers, rows: dataRows }]); }
+  catch (e) { console.warn("[schema] csv build failed", e); }
+
+  const cube = buildBestCube(file.name, [{ name: file.name, aoa }], schema);
 
   if (aoa.length <= RAW_ROW_LIMIT + 1) {
     return { content:text, sheets:[], rowCount:aoa.length-1, fileType:"csv", fileName:file.name,
-             chars:text.length, truncated:false, summarized:false, cube };
+             chars:text.length, truncated:false, summarized:false, cube, schema };
   }
   let summary = summarizeSheet(file.name, aoa);
+  if (schema) summary += "\n" + schemaToText(schema);
   if (cube) summary += `\n[INTERACTIVE DASHBOARD: enabled — ${cube.sourceRowCount.toLocaleString()} rows, ${cube.dateRange.min} to ${cube.dateRange.max}]`;
   return { content:summary, sheets:[], rowCount:aoa.length-1, fileType:"csv", fileName:file.name,
-           chars:summary.length, truncated:false, summarized:true, cube };
+           chars:summary.length, truncated:false, summarized:true, cube, schema };
 }
 
 // ── PDF / TXT / JSON (no cube — not tabular) ───────────────
@@ -347,14 +404,14 @@ async function parsePDF(file: File): Promise<ParseResult> {
   const content  = pages.join("\n\n").trim();
   return { content, sheets:[], rowCount:content.split("\n").filter(l=>l.trim()).length,
            fileType:"pdf", fileName:file.name, chars:content.length,
-           truncated:content.length > MAX_CONTENT_CHARS, summarized:false, cube:null };
+           truncated:content.length > MAX_CONTENT_CHARS, summarized:false, cube:null, schema:null };
 }
 
 async function parseTXT(file: File): Promise<ParseResult> {
   const text = await file.text();
   return { content:text, sheets:[], rowCount:text.split("\n").filter(l=>l.trim()).length,
            fileType:"txt", fileName:file.name, chars:text.length,
-           truncated:text.length>MAX_CONTENT_CHARS, summarized:false, cube:null };
+           truncated:text.length>MAX_CONTENT_CHARS, summarized:false, cube:null, schema:null };
 }
 
 async function parseJSON(file: File): Promise<ParseResult> {
@@ -363,7 +420,7 @@ async function parseJSON(file: File): Promise<ParseResult> {
   const content = JSON.stringify(parsed, null, 2);
   return { content, sheets:[], rowCount:Array.isArray(parsed)?parsed.length:Object.keys(parsed).length,
            fileType:"json", fileName:file.name, chars:content.length,
-           truncated:false, summarized:false, cube:null };
+           truncated:false, summarized:false, cube:null, schema:null };
 }
 
 // ── Main export ────────────────────────────────────────────

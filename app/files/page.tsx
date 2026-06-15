@@ -9,7 +9,7 @@ import {
   getUserFolders, createFolder, getFolderFiles,
   addFileToFolder, updateFileRecord,
   saveFolderFullAnalysis, getFolderFullAnalysis,
-  saveFileCube,
+  saveFileCube, saveFileSchema,
   BusinessFolder, FolderFile,
 } from "@/lib/db";
 import Nav from "@/components/Nav";
@@ -161,6 +161,15 @@ export default function FilesPage() {
           }
         }
 
+        // Save the schema model (powers the Developer tab)
+        if (data.schema) {
+          try {
+            await saveFileSchema(user.uid, activeFolderId, fileId, data.schema);
+          } catch (schemaErr) {
+            console.warn("[schema] save failed:", schemaErr);
+          }
+        }
+
         if (data.content) {
           setEmbeddingStatus(prev => ({ ...prev, [fileId]: "embedding" }));
           triggerEmbedding(user.uid, fileId, activeFolderId, file.name, data.content);
@@ -247,6 +256,9 @@ export default function FilesPage() {
         folderId:      activeFolderId,
         cubeFiles:     files
           .filter(f => f.status === "ready" && f.hasCube && f.id)
+          .map(f => ({ id: f.id!, name: f.name })),
+        schemaFiles:   files
+          .filter(f => f.status === "ready" && f.hasSchema && f.id)
           .map(f => ({ id: f.id!, name: f.name })),
       }));
     } catch {}

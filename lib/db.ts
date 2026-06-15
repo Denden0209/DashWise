@@ -64,6 +64,7 @@ export type FolderFile = {
   uploadedAt?:    unknown;
   hasCube?:       boolean;   // true = interactive dashboard data available
   cubeChunks?:    number;    // number of chunk docs in the cube subcollection
+  hasSchema?:     boolean;   // true = developer-tab schema model available
 };
 
 export type ChatMessage = {
@@ -192,7 +193,33 @@ export async function getFileCube<T = unknown>(uid: string, folderId: string, fi
   try { return JSON.parse(parts.join("")) as T; } catch { return null; }
 }
 
-// ── Uploads (legacy) ───────────────────────────────────────
+// ── Schema model (Developer tab) ───────────────────────────
+// The schema model is metadata only (no data rows) so it fits in one doc.
+export async function saveFileSchema(uid: string, folderId: string, fileId: string, schema: unknown): Promise<void> {
+  const json = JSON.stringify(schema);
+  // Safety: chunk if a very wide workbook pushes past the 1MB limit
+  const CHUNK = 700_000;
+  if (json.length <= CHUNK) {
+    await setDoc(doc(db, "users", uid, "folders", folderId, "files", fileId, "schema", "0"), { idx: 0, data: json });
+  } else {
+    const chunks: string[] = [];
+    for (let i = 0; i < json.length; i += CHUNK) chunks.push(json.slice(i, i + CHUNK));
+    await Promise.all(chunks.map((data, idx) =>
+      setDoc(doc(db, "users", uid, "folders", folderId, "files", fileId, "schema", String(idx)), { idx, data })
+    ));
+  }
+  await updateDoc(doc(db, "users", uid, "folders", folderId, "files", fileId), { hasSchema: true });
+}
+
+export async function getFileSchema<T = unknown>(uid: string, folderId: string, fileId: string): Promise<T | null> {
+  const snap = await getDocs(collection(db, "users", uid, "folders", folderId, "files", fileId, "schema"));
+  if (snap.empty) return null;
+  const parts = snap.docs
+    .map(d => d.data() as { idx: number; data: string })
+    .sort((a, b) => a.idx - b.idx)
+    .map(p => p.data);
+  try { return JSON.parse(parts.join("")) as T; } catch { return null; }
+}
 export async function saveUpload(uid: string, data: Omit<UploadRecord, "id">): Promise<string> {
   const ref = await addDoc(collection(db, "users", uid, "uploads"), { ...data, date: serverTimestamp() });
   await updateDoc(doc(db, "users", uid), { uploadsCount: increment(1) }).catch(() => {});
