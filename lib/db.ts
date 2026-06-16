@@ -1,6 +1,6 @@
 // lib/db.ts — All Firestore operations
 import {
-  doc, getDoc, setDoc, addDoc, updateDoc, collection,
+  doc, getDoc, setDoc, addDoc, updateDoc, deleteDoc, collection,
   query, orderBy, limit, getDocs, serverTimestamp, increment,
 } from "firebase/firestore";
 import { db } from "./firebase";
@@ -117,6 +117,38 @@ export async function getUserFolders(uid: string): Promise<BusinessFolder[]> {
   const q    = query(collection(db, "users", uid, "folders"), orderBy("createdAt", "desc"));
   const snap = await getDocs(q);
   return snap.docs.map(d => ({ id: d.id, ...d.data() } as BusinessFolder));
+}
+
+export async function renameFolder(uid: string, folderId: string, newName: string): Promise<void> {
+  await updateDoc(doc(db, "users", uid, "folders", folderId), { bizName: newName });
+}
+
+// Delete a folder and all its files (+ their cube/schema subcollections)
+export async function deleteFolder(uid: string, folderId: string): Promise<void> {
+  const filesSnap = await getDocs(collection(db, "users", uid, "folders", folderId, "files"));
+  for (const fileDoc of filesSnap.docs) {
+    // delete cube + schema subcollections under each file
+    for (const sub of ["cube", "schema"]) {
+      const subSnap = await getDocs(collection(db, "users", uid, "folders", folderId, "files", fileDoc.id, sub));
+      await Promise.all(subSnap.docs.map(d => deleteDoc(d.ref)));
+    }
+    await deleteDoc(fileDoc.ref);
+  }
+  await deleteDoc(doc(db, "users", uid, "folders", folderId));
+}
+
+export async function renameFile(uid: string, folderId: string, fileId: string, newName: string): Promise<void> {
+  await updateDoc(doc(db, "users", uid, "folders", folderId, "files", fileId), { name: newName });
+}
+
+// Delete one file and its cube/schema subcollections, decrement folder count
+export async function deleteFileFull(uid: string, folderId: string, fileId: string): Promise<void> {
+  for (const sub of ["cube", "schema"]) {
+    const subSnap = await getDocs(collection(db, "users", uid, "folders", folderId, "files", fileId, sub));
+    await Promise.all(subSnap.docs.map(d => deleteDoc(d.ref)));
+  }
+  await deleteDoc(doc(db, "users", uid, "folders", folderId, "files", fileId));
+  await updateDoc(doc(db, "users", uid, "folders", folderId), { fileCount: increment(-1) }).catch(() => {});
 }
 
 export async function saveFolderAnalysis(uid: string, folderId: string, summary: string): Promise<void> {

@@ -1,20 +1,17 @@
 "use client";
-// lib/AuthContext.tsx
 import { createContext, useContext, useEffect, useState, ReactNode } from "react";
 import { onAuthStateChanged, User } from "firebase/auth";
 import { auth } from "./firebase";
-import { getUserProfile, BusinessProfile } from "./db";
+import { getUserProfile, saveUserProfile, BusinessProfile } from "./db";
 
-type AuthContextType = {
-  user:            User | null;
-  profile:         BusinessProfile | null;
-  loading:         boolean;
-  refreshProfile:  () => Promise<void>;
+type AuthCtx = {
+  user:          User | null;
+  profile:       BusinessProfile | null;
+  loading:       boolean;
+  refreshProfile: () => Promise<void>;
 };
-
-const AuthContext = createContext<AuthContextType>({
-  user: null, profile: null, loading: true,
-  refreshProfile: async () => {},
+const Ctx = createContext<AuthCtx>({
+  user: null, profile: null, loading: true, refreshProfile: async () => {},
 });
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -22,10 +19,30 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [profile, setProfile] = useState<BusinessProfile | null>(null);
   const [loading, setLoading] = useState(true);
 
+  async function ensureUserDoc(u: User): Promise<BusinessProfile> {
+    // Load existing profile first
+    let prof = await getUserProfile(u.uid);
+    if (!prof) {
+      // First time this account has hit Firestore — create a minimal document.
+      // This guarantees the admin panel always sees every authenticated user,
+      // and prevents the "Failed to save" onboarding error caused by a missing doc.
+      const base: BusinessProfile = {
+        uid:          u.uid,
+        email:        u.email        || "",
+        name:         u.displayName  || "",
+        bizName:      "",
+        bizType:      "",
+        subscription: "free",
+        uploadsCount: 0,
+      };
+      await saveUserProfile(u.uid, base);
+      prof = base;
+    }
+    return prof;
+  }
+
   async function refreshProfile() {
-    if (!user) return;
-    const p = await getUserProfile(user.uid);
-    setProfile(p);
+    if (auth.currentUser) setProfile(await getUserProfile(auth.currentUser.uid));
   }
 
   useEffect(() => {
@@ -33,9 +50,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(u);
       if (u) {
         try {
-          const p = await getUserProfile(u.uid);
-          setProfile(p);
-        } catch { setProfile(null); }
+          const prof = await ensureUserDoc(u);
+          setProfile(prof);
+        } catch (err) {
+          console.warn("[auth] could not ensure user doc:", err);
+          // Still try a plain load so the app works in offline/rules scenarios
+          setProfile(await getUserProfile(u.uid).catch(() => null));
+        }
       } else {
         setProfile(null);
       }
@@ -44,11 +65,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     return () => unsub();
   }, []);
 
-  return (
-    <AuthContext.Provider value={{ user, profile, loading, refreshProfile }}>
-      {children}
-    </AuthContext.Provider>
-  );
+  return <Ctx.Provider value={{ user, profile, loading, refreshProfile }}>{children}</Ctx.Provider>;
 }
 
-export function useAuth() { return useContext(AuthContext); }
+export const useAuth = () => useContext(Ctx);
