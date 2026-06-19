@@ -10,12 +10,12 @@
 import { useEffect, useMemo, useState, useCallback } from "react";
 import { onAuthStateChanged, User } from "firebase/auth";
 import { auth } from "@/lib/firebase";
-import { getFileCube, getFileSchema } from "@/lib/db";
+import { getFileCube, getFileSchema, saveDashboardConfig, getDashboardConfig } from "@/lib/db";
 import {
-  DataCube, Filters, DateWindow, Grain, MeasureSpec,
+  DataCube, Filters, DateWindow, Grain, MeasureSpec, Agg,
   filterRows, computeMeasure, seriesByGrain, byDimension,
   yoyOverlay, periodComparison, timeCapabilities, presetWindow,
-  formatMeasureValue,
+  formatMeasureValue, inferAgg, specForMeasure,
 } from "@/lib/dataCube";
 import type { SchemaModel, TableInfo, ColumnInfo } from "@/lib/schemaProfiler";
 import { schemaToText } from "@/lib/schemaProfiler";
@@ -48,6 +48,23 @@ type AgentKpi   = { label:string; measure:MeasureSpec };
 type AgentSpec  = {
   filters: Filters; grain: Grain; yoy: boolean;
   dateWindow?: DateWindow; kpis: AgentKpi[]; charts: AgentChart[]; note: string;
+};
+
+// ── Per-file dashboard customizations (persisted to Firestore) ──
+type SavedView = {
+  measure: string; agg: Agg; grain: Grain; primaryDim?: string;
+  preset: "all"|"ytd"|"l12m"|"lastyear"|"custom";
+  customFrom?: string; customTo?: string; yoy?: boolean;
+  fromAgent?: boolean;   // true if this view was authored by the agent (locks layout on restore)
+  filters: Filters; kpis: AgentKpi[]; charts: AgentChart[]; note: string;
+};
+type DashConfig = {
+  setupDone?: boolean;
+  title?: string;
+  notes?: string;
+  kpiLabels?: Record<number, string>;
+  chartTitles?: Record<number, string>;
+  view?: SavedView;
 };
 
 const fmtCompact = (v:number) =>
@@ -225,6 +242,8 @@ function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
   const [grain, setGrain]       = useState<Grain>("month");
   const [yoyOn, setYoyOn]       = useState(false);
   const [measure, setMeasure]   = useState("");
+  const [measureAgg, setMeasureAgg] = useState<Agg>("sum");
+  const [primaryDim, setPrimaryDim] = useState("");   // breakdown the user cares about most
 
   const [agentOpen, setAgentOpen]       = useState(false);
   const [agentQ, setAgentQ]             = useState("");
@@ -232,22 +251,66 @@ function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
   const [agentErr, setAgentErr]         = useState("");
   const [agentView, setAgentView]       = useState<AgentSpec | null>(null);
 
-  // Load cube whenever file changes
+  // ── Customizations (persisted per file) ──
+  const [setupOpen, setSetupOpen] = useState(false);
+  const [editing, setEditing]     = useState(false);
+  const [title, setTitle]         = useState("");
+  const [notes, setNotes]         = useState("");
+  const [kpiLabels, setKpiLabels]     = useState<Record<number, string>>({});
+  const [chartTitles, setChartTitles] = useState<Record<number, string>>({});
+  const [saving, setSaving]       = useState(false);
+  const [savedTick, setSavedTick] = useState(false);
+
+  // Pick the field whose name reads most like a headline metric (money first).
+  const defaultMeasure = useCallback((cb: DataCube) => cb.moneyMeasures[0] || cb.measures[0] || "", []);
+
+  // Load cube + saved config whenever file changes
   useEffect(() => {
     if (!fileId || !payload.folderId) { setLoading(false); return; }
+    const folderId = payload.folderId;
     setLoading(true); setLoadErr(""); setCube(null); setAgentView(null);
-    getFileCube<DataCube>(user.uid, payload.folderId, fileId)
-      .then(cb => {
+    setEditing(false); setSetupOpen(false);
+    Promise.all([
+      getFileCube<DataCube>(user.uid, folderId, fileId),
+      getDashboardConfig<DashConfig>(user.uid, folderId, fileId).catch(() => null),
+    ])
+      .then(([cb, cfg]) => {
         if (!cb) { setLoadErr("No interactive data found for this file. Re-upload it to enable filtering."); return; }
         setCube(cb);
         const caps = timeCapabilities(cb);
-        setGrain(caps.grains.includes("month") ? "month" : caps.grains[0]);
-        setMeasure(cb.moneyMeasures[0] || cb.measures[0] || "");
+        // Defaults
         setFilters({}); setPreset("all"); setYoyOn(false);
+        setGrain(caps.grains.includes("month") ? "month" : caps.grains[0]);
+        const dm = defaultMeasure(cb);
+        setMeasure(dm); setMeasureAgg(inferAgg(dm));
+        setPrimaryDim(cb.dimensions[0]?.name || "");
+        // Customizations
+        setTitle(cfg?.title || "");
+        setNotes(cfg?.notes || "");
+        setKpiLabels(cfg?.kpiLabels || {});
+        setChartTitles(cfg?.chartTitles || {});
+        // Restore a saved starter/custom view if present
+        if (cfg?.view) {
+          const v = cfg.view;
+          if (cb.measures.includes(v.measure)) { setMeasure(v.measure); setMeasureAgg(v.agg || inferAgg(v.measure)); }
+          if (v.primaryDim !== undefined) setPrimaryDim(v.primaryDim);
+          if (caps.grains.includes(v.grain)) setGrain(v.grain);
+          setFilters(v.filters || {});
+          setPreset(v.preset || "all");
+          if (v.preset === "custom") { setCustomFrom(v.customFrom || ""); setCustomTo(v.customTo || ""); }
+          setYoyOn(!!v.yoy && caps.yoy);
+          // Only an agent-authored view locks the layout; otherwise just restore the live controls.
+          if (v.fromAgent) setAgentView({ filters: v.filters || {}, grain: v.grain, yoy: !!v.yoy, kpis: v.kpis || [], charts: v.charts || [], note: v.note || "Saved view" });
+        }
+        // First run for this file → guided setup
+        if (!cfg?.setupDone) setSetupOpen(true);
       })
       .catch(() => setLoadErr("Failed to load dashboard data. Check your connection and reopen."))
       .finally(() => setLoading(false));
-  }, [fileId, payload.folderId, user.uid]);
+  }, [fileId, payload.folderId, user.uid, defaultMeasure]);
+
+  // Keep the chosen aggregation sensible when the user switches measures by hand.
+  const selectMeasure = useCallback((m: string) => { setMeasure(m); setMeasureAgg(inferAgg(m)); }, []);
 
   const caps = useMemo(() => cube ? timeCapabilities(cube) : null, [cube]);
 
@@ -259,11 +322,7 @@ function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
 
   const rows = useMemo(() => cube ? filterRows(cube, filters, win) : [], [cube, filters, win]);
 
-  const money = useCallback((field:string) => (v:number) => cube ? formatMeasureValue(v, field, cube) : fmtCompact(v), [cube]);
-  const spec: MeasureSpec = useMemo(() => ({ kind:"field", field: measure }), [measure]);
-
-  const trend   = useMemo(() => cube && measure ? seriesByGrain(rows, grain, spec) : [], [cube, rows, grain, spec, measure]);
-  const overlay = useMemo(() => cube && yoyOn && caps?.yoy ? yoyOverlay(rows, spec) : null, [cube, rows, spec, yoyOn, caps]);
+  const spec: MeasureSpec = useMemo(() => measure ? specForMeasure(measure, measureAgg) : { kind:"count" }, [measure, measureAgg]);
 
   function toggleFilter(dim:string, val:string) {
     setFilters(prev => {
@@ -316,6 +375,41 @@ function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
     if (cube) { const cp = timeCapabilities(cube); setGrain(cp.grains.includes("month") ? "month" : cp.grains[0]); }
   }
 
+  // ── Persist the current dashboard (called by Save / wizard / agent) ──
+  const persistConfig = useCallback(async (patch: Partial<DashConfig>) => {
+    if (!cube || !payload.folderId) return;
+    setSaving(true);
+    try {
+      const existing = await getDashboardConfig<DashConfig>(user.uid, payload.folderId, fileId).catch(() => null);
+      await saveDashboardConfig(user.uid, payload.folderId, fileId, { ...(existing || {}), ...patch });
+      setSavedTick(true); setTimeout(() => setSavedTick(false), 1800);
+    } catch { /* non-fatal */ }
+    finally { setSaving(false); }
+  }, [cube, payload.folderId, fileId, user.uid]);
+
+  // Snapshot the live controls into a SavedView the next open can restore.
+  function currentViewSnapshot(activeKpis: AgentKpi[], activeCharts: AgentChart[], note: string): SavedView {
+    return {
+      measure, agg: measureAgg, grain, primaryDim, preset,
+      customFrom: preset === "custom" ? customFrom : undefined,
+      customTo:   preset === "custom" ? customTo   : undefined,
+      yoy: yoyOn, fromAgent: !!agentView, filters, kpis: activeKpis, charts: activeCharts, note,
+    };
+  }
+
+  // Apply the guided-setup answers to the live dashboard controls.
+  function applySetup(opts: { measure: string; agg: Agg; breakdown: string; preset: "all"|"ytd"|"l12m"|"lastyear" }) {
+    setAgentView(null);                       // setup drives the live controls, not a locked view
+    setMeasure(opts.measure);
+    setMeasureAgg(opts.agg);
+    setPrimaryDim(opts.breakdown);
+    setFilters({});
+    setPreset(opts.preset);
+    if (caps) setGrain(caps.grains.includes("month") ? "month" : caps.grains[0]);
+    setSetupOpen(false);
+    persistConfig({ setupDone: true });
+  }
+
   if (loading) return <div style={{ display:"flex", alignItems:"center", justifyContent:"center", gap:12, padding:60 }}><Spinner size={26}/><span style={{ fontSize:13, color:C.text3 }}>Loading interactive data...</span></div>;
   if (loadErr || !cube) return (
     <div style={{ textAlign:"center", padding:"50px 20px" }}>
@@ -325,27 +419,49 @@ function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
     </div>
   );
 
-  const kpiSpecs: AgentKpi[] = agentView?.kpis?.length
+  // KPI cards: each measure aggregated by its smart default (sum vs avg)
+  const aggLabel = (m:string, a:Agg) => a === "avg" ? `Avg ${m}` : m;
+  const baseKpis: AgentKpi[] = agentView?.kpis?.length
     ? agentView.kpis
-    : cube.measures.slice(0, 4).map(m => ({ label: m, measure: { kind:"field", field:m } as MeasureSpec }));
+    : cube.measures.slice(0, 4).map(m => {
+        const a = inferAgg(m);
+        return { label: aggLabel(m, a), measure: specForMeasure(m, a) };
+      });
+  // Apply user label overrides (edit mode)
+  const kpiSpecs: AgentKpi[] = baseKpis.map((k, i) => ({ ...k, label: kpiLabels[i] ?? k.label }));
 
-  const chartSpecs: AgentChart[] = agentView?.charts?.length
+  // Order dimension charts so the user's chosen breakdown leads.
+  const orderedDims = primaryDim && cube.dimensions.some(d => d.name === primaryDim)
+    ? [primaryDim, ...cube.dimensions.filter(d => d.name !== primaryDim).map(d => d.name)]
+    : cube.dimensions.map(d => d.name);
+  const baseCharts: AgentChart[] = agentView?.charts?.length
     ? agentView.charts
     : [
-        { type:"line",  title:`${measure} over time`, dimension:"_date", measure:spec, topN:10 },
-        ...cube.dimensions.slice(0, 2).map((d, i) => ({
+        { type:"line",  title:`${aggLabel(measure, measureAgg)} over time`, dimension:"_date", measure:spec, topN:10 },
+        ...orderedDims.slice(0, 2).map((name, i) => ({
           type: (i === 1 ? "donut" : "bar") as AgentChart["type"],
-          title:`${measure} by ${d.name}`, dimension:d.name, measure:spec, topN:10,
+          title:`${aggLabel(measure, measureAgg)} by ${name}`, dimension:name, measure:spec, topN:10,
         })),
       ];
+  const chartSpecs: AgentChart[] = baseCharts.map((c, i) => ({ ...c, title: chartTitles[i] ?? c.title }));
 
   const isPctSpec = (m:MeasureSpec) => m.kind === "marginPct" || (m.kind === "ratio" && !!m.pct);
   const fmtForSpec = (m:MeasureSpec) => (v:number) => {
     if (isPctSpec(m)) return `${v.toFixed(1)}%`;
-    if (m.kind === "field") return formatMeasureValue(v, m.field, cube);
+    if (m.kind === "field" || m.kind === "avg") return formatMeasureValue(v, m.field, cube);
     if (m.kind === "ratio") return v.toFixed(2);
     return fmtCompact(v);
   };
+
+  const dashTitle = title.trim() || `${cube.fileName.replace(/\.[^.]+$/, "")} — Explore`;
+
+  function handleSave() {
+    persistConfig({
+      setupDone: true, title, notes, kpiLabels, chartTitles,
+      view: currentViewSnapshot(baseKpis, baseCharts, agentView?.note || "Saved view"),
+    });
+    setEditing(false);
+  }
 
   return (
     <div style={{ display:"flex", gap:16, alignItems:"flex-start" }}>
@@ -463,20 +579,72 @@ function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
       {/* ══ MAIN AREA ══ */}
       <div style={{ flex:1, minWidth:0, display:"flex", flexDirection:"column", gap:16 }}>
 
-        {/* Measure selector + row count */}
-        <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
-          <span style={{ fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3 }}>Measure:</span>
-          {cube.measures.slice(0, 6).map(m => (
-            <button key={m} onClick={()=>setMeasure(m)} style={{
-              fontSize:12, padding:"6px 13px", borderRadius:16, cursor:"pointer",
-              background: measure===m ? C.text : C.surface, color: measure===m ? "#fff" : C.text2,
-              border:`1px solid ${measure===m ? C.text : C.border}`, fontWeight: measure===m ? 600 : 400,
-            }}>{m}</button>
-          ))}
-          <span style={{ marginLeft:"auto", fontSize:11, color:C.text3 }}>
-            {rows.reduce((s,r)=>s+r.n,0).toLocaleString()} rows in view
-          </span>
+        {/* Title + edit toolbar */}
+        <div style={{ display:"flex", alignItems:"flex-start", gap:12, flexWrap:"wrap" }}>
+          <div style={{ flex:1, minWidth:200 }}>
+            {editing ? (
+              <input
+                value={title} onChange={e=>setTitle(e.target.value)}
+                placeholder={dashTitle}
+                style={{ width:"100%", fontSize:19, fontWeight:700, letterSpacing:"-0.3px", color:C.text, border:`1px dashed ${C.blue}`, borderRadius:8, padding:"5px 9px", outline:"none", background:C.surface }}
+              />
+            ) : (
+              <h2 style={{ fontSize:19, fontWeight:700, letterSpacing:"-0.3px", color:C.text }}>{dashTitle}</h2>
+            )}
+            {(editing || notes.trim()) && (
+              editing ? (
+                <input
+                  value={notes} onChange={e=>setNotes(e.target.value)}
+                  placeholder="Add a subtitle or note (optional)…"
+                  style={{ width:"100%", marginTop:6, fontSize:12.5, color:C.text2, border:`1px dashed ${C.border}`, borderRadius:7, padding:"5px 9px", outline:"none", background:C.surface }}
+                />
+              ) : (
+                <div style={{ marginTop:4, fontSize:12.5, color:C.text2 }}>{notes}</div>
+              )
+            )}
+          </div>
+          <div style={{ display:"flex", gap:8, alignItems:"center" }}>
+            <button onClick={()=>setSetupOpen(true)} style={{ fontSize:12, fontWeight:600, color:C.text2, background:C.surface, border:`1px solid ${C.border}`, borderRadius:9, padding:"8px 13px", cursor:"pointer" }}>✨ Setup</button>
+            {editing ? (
+              <>
+                <button onClick={()=>setEditing(false)} style={{ fontSize:12, padding:"8px 13px", borderRadius:9, background:"transparent", border:`1px solid ${C.border}`, color:C.text2, cursor:"pointer" }}>Cancel</button>
+                <button onClick={handleSave} disabled={saving} style={{ fontSize:12, fontWeight:600, padding:"8px 15px", borderRadius:9, background:C.blue, border:"none", color:"#fff", cursor:"pointer", display:"flex", alignItems:"center", gap:7, opacity:saving?.7:1 }}>
+                  {saving ? <><Spinner size={12} color="#fff"/> Saving…</> : "💾 Save"}
+                </button>
+              </>
+            ) : (
+              <button onClick={()=>setEditing(true)} style={{ fontSize:12, fontWeight:600, color:C.blue, background:C.blueBg, border:`1px solid #c0d8f5`, borderRadius:9, padding:"8px 15px", cursor:"pointer" }}>✏️ Edit</button>
+            )}
+            {savedTick && <span style={{ fontSize:11.5, fontWeight:600, color:C.green }}>✓ Saved</span>}
+          </div>
         </div>
+
+        {/* Measure selector + aggregation toggle + row count */}
+        {!agentView && (
+          <div style={{ display:"flex", alignItems:"center", gap:10, flexWrap:"wrap" }}>
+            <span style={{ fontSize:11, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3 }}>Measure:</span>
+            {cube.measures.slice(0, 6).map(m => (
+              <button key={m} onClick={()=>selectMeasure(m)} style={{
+                fontSize:12, padding:"6px 13px", borderRadius:16, cursor:"pointer",
+                background: measure===m ? C.text : C.surface, color: measure===m ? "#fff" : C.text2,
+                border:`1px solid ${measure===m ? C.text : C.border}`, fontWeight: measure===m ? 600 : 400,
+              }}>{m}</button>
+            ))}
+            {/* Sum / Avg toggle — defaults to the smart guess for the field */}
+            <div style={{ display:"flex", gap:3, background:C.bg, border:`1px solid ${C.border}`, borderRadius:14, padding:2, marginLeft:4 }} title="How to aggregate this measure">
+              {(["sum","avg"] as Agg[]).map(a => (
+                <button key={a} onClick={()=>setMeasureAgg(a)} style={{
+                  fontSize:11, padding:"4px 11px", borderRadius:12, cursor:"pointer", textTransform:"uppercase", letterSpacing:"0.4px",
+                  background: measureAgg===a ? C.blue : "transparent", color: measureAgg===a ? "#fff" : C.text3,
+                  border:"none", fontWeight: measureAgg===a ? 700 : 500,
+                }}>{a}</button>
+              ))}
+            </div>
+            <span style={{ marginLeft:"auto", fontSize:11, color:C.text3 }}>
+              {rows.reduce((s,r)=>s+r.n,0).toLocaleString()} rows in view
+            </span>
+          </div>
+        )}
 
         {/* KPI cards */}
         <div style={{ display:"grid", gridTemplateColumns:`repeat(auto-fit, minmax(170px, 1fr))`, gap:12 }}>
@@ -485,7 +653,15 @@ function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
             const cmp = caps?.yoy && !yoyOn ? periodComparison(cube, filters, k.measure, 365) : null;
             return (
               <div key={i} style={{ background:C.surface, border:`1px solid ${C.border}`, borderRadius:14, padding:"15px 17px", boxShadow:shadowSm }}>
-                <div style={{ fontSize:10.5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3, marginBottom:8, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{k.label}</div>
+                {editing ? (
+                  <input
+                    value={kpiLabels[i] ?? k.label}
+                    onChange={e=>setKpiLabels(prev => ({ ...prev, [i]: e.target.value }))}
+                    style={{ width:"100%", fontSize:10.5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3, marginBottom:8, border:`1px dashed ${C.border}`, borderRadius:6, padding:"3px 6px", outline:"none", background:C.bg }}
+                  />
+                ) : (
+                  <div style={{ fontSize:10.5, fontWeight:600, textTransform:"uppercase", letterSpacing:"0.7px", color:C.text3, marginBottom:8, overflow:"hidden", textOverflow:"ellipsis", whiteSpace:"nowrap" }}>{k.label}</div>
+                )}
                 <div style={{ fontSize:21, fontWeight:700, letterSpacing:"-0.4px", color:C.text }}>{fmtForSpec(k.measure)(val)}</div>
                 {cmp && cmp.deltaPct !== null && preset === "all" && (
                   <div style={{ fontSize:10.5, fontWeight:600, marginTop:5, color: cmp.deltaPct >= 0 ? C.green : C.red }}>
@@ -500,14 +676,25 @@ function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
         {/* Charts */}
         {chartSpecs.map((ch, i) => {
           const fmt = fmtForSpec(ch.measure);
+          const titleEl = editing ? (
+            <input
+              value={chartTitles[i] ?? ch.title}
+              onChange={e=>setChartTitles(prev => ({ ...prev, [i]: e.target.value }))}
+              style={{ width:"100%", fontSize:12.5, fontWeight:600, color:C.text, border:`1px dashed ${C.blue}`, borderRadius:7, padding:"5px 8px", outline:"none", marginBottom:8, background:C.surface }}
+            />
+          ) : null;
+          let chartNode: React.ReactNode;
           if (ch.dimension === "_date") {
             const s  = seriesByGrain(rows, grain, ch.measure);
             const ov = yoyOn && caps?.yoy ? yoyOverlay(rows, ch.measure) : null;
-            return <TrendChart key={i} title={ch.title + (yoyOn ? " — year comparison" : "")} series={s} overlay={ov} money={fmt}/>;
+            chartNode = <TrendChart title={ch.title + (yoyOn ? " — year comparison" : "")} series={s} overlay={ov} money={fmt}/>;
+          } else {
+            const data = byDimension(rows, ch.dimension, ch.measure, ch.topN);
+            chartNode = ch.type === "donut"
+              ? <DonutChart title={ch.title} data={data} money={fmt}/>
+              : <HBarChart title={ch.title} data={data} money={fmt}/>;
           }
-          const data = byDimension(rows, ch.dimension, ch.measure, ch.topN);
-          if (ch.type === "donut") return <DonutChart key={i} title={ch.title} data={data} money={fmt}/>;
-          return <HBarChart key={i} title={ch.title} data={data} money={fmt}/>;
+          return <div key={i}>{titleEl}{chartNode}</div>;
         })}
 
         <div style={{ fontSize:10.5, color:C.text3, textAlign:"center", padding:"4px 0 12px" }}>
@@ -547,6 +734,92 @@ function ExploreTab({ payload, user }: { payload: Payload; user: User }) {
           </div>
         </div>
       )}
+
+      {/* ══ GUIDED SETUP WIZARD ══ */}
+      {setupOpen && <SetupWizard cube={cube} caps={caps} initial={{ measure, agg: measureAgg, breakdown: primaryDim }} onApply={applySetup} onClose={()=>{ setSetupOpen(false); if (!agentView) persistConfig({ setupDone: true }); }}/>}
+    </div>
+  );
+}
+
+// ═══════════════ GUIDED SETUP WIZARD ═══════════════
+// A short "where do you want to start" flow shown when a dashboard first opens.
+// Every choice is derived from the live cube, so the suggestions always fit the data.
+function SetupWizard({ cube, caps, initial, onApply, onClose }: {
+  cube: DataCube;
+  caps: { grains: Grain[]; multiYear: boolean; yoy: boolean; years: string[] } | null;
+  initial: { measure: string; agg: Agg; breakdown: string };
+  onApply: (o: { measure: string; agg: Agg; breakdown: string; preset: "all"|"ytd"|"l12m"|"lastyear" }) => void;
+  onClose: () => void;
+}) {
+  const [measure, setMeasure]     = useState(initial.measure || cube.measures[0] || "");
+  const [agg, setAgg]             = useState<Agg>(initial.agg || inferAgg(initial.measure || cube.measures[0] || ""));
+  const [breakdown, setBreakdown] = useState(initial.breakdown ?? (cube.dimensions[0]?.name || ""));
+  const [preset, setPreset]       = useState<"all"|"ytd"|"l12m"|"lastyear">(caps?.multiYear ? "l12m" : "all");
+
+  const section = (n:number, title:string, hint?:string) => (
+    <div style={{ display:"flex", alignItems:"baseline", gap:8, margin:"18px 0 9px" }}>
+      <span style={{ fontSize:11, fontWeight:700, color:"#fff", background:C.blue, borderRadius:"50%", width:19, height:19, display:"flex", alignItems:"center", justifyContent:"center", flexShrink:0 }}>{n}</span>
+      <span style={{ fontSize:13, fontWeight:700, color:C.text }}>{title}</span>
+      {hint && <span style={{ fontSize:11, color:C.text3 }}>{hint}</span>}
+    </div>
+  );
+  const chip = (on:boolean) => ({
+    fontSize:12, padding:"7px 13px", borderRadius:16, cursor:"pointer",
+    background: on ? C.blue : C.surface, color: on ? "#fff" : C.text2,
+    border:`1px solid ${on ? C.blue : C.border}`, fontWeight: on ? 600 : 400,
+  } as const);
+
+  type TPreset = "all"|"ytd"|"l12m"|"lastyear";
+  const timeOpts: [TPreset, string][] = [
+    ["all","All time"],
+    ...(caps?.multiYear ? ([["ytd","Year to date"],["l12m","Last 12 months"],["lastyear","Last year"]] as [TPreset, string][]) : []),
+  ];
+
+  return (
+    <div style={{ position:"fixed", inset:0, background:"rgba(0,0,0,0.45)", zIndex:210, display:"flex", alignItems:"center", justifyContent:"center", padding:20 }}>
+      <div style={{ background:C.surface, borderRadius:18, padding:26, width:"100%", maxWidth:560, maxHeight:"90vh", overflowY:"auto", boxShadow:"0 20px 60px rgba(0,0,0,0.3)" }}>
+        <div style={{ fontSize:18, fontWeight:700, color:C.text, marginBottom:3 }}>✨ Let&apos;s build your dashboard</div>
+        <div style={{ fontSize:12.5, color:C.text3, marginBottom:6 }}>A few quick choices to start from — you can change everything later, or just skip.</div>
+
+        {section(1, "Which metric matters most?")}
+        <div style={{ display:"flex", flexWrap:"wrap", gap:7 }}>
+          {cube.measures.slice(0, 8).map(m => (
+            <button key={m} onClick={()=>{ setMeasure(m); setAgg(inferAgg(m)); }} style={chip(measure===m)}>{m}</button>
+          ))}
+        </div>
+
+        {section(2, "How should we summarize it?", `we suggest ${inferAgg(measure).toUpperCase()}`)}
+        <div style={{ display:"flex", gap:7 }}>
+          <button onClick={()=>setAgg("sum")} style={chip(agg==="sum")}>Sum (total)</button>
+          <button onClick={()=>setAgg("avg")} style={chip(agg==="avg")}>Average</button>
+        </div>
+
+        {section(3, "Break it down by…")}
+        <div style={{ display:"flex", flexWrap:"wrap", gap:7 }}>
+          <button onClick={()=>setBreakdown("")} style={chip(breakdown==="")}>📈 Just over time</button>
+          {cube.dimensions.map(d => (
+            <button key={d.name} onClick={()=>setBreakdown(d.name)} style={chip(breakdown===d.name)}>{d.name}</button>
+          ))}
+        </div>
+
+        {timeOpts.length > 1 && (
+          <>
+            {section(4, "Time range")}
+            <div style={{ display:"flex", flexWrap:"wrap", gap:7 }}>
+              {timeOpts.map(([k, lbl]) => (
+                <button key={k} onClick={()=>setPreset(k)} style={chip(preset===k)}>{lbl}</button>
+              ))}
+            </div>
+          </>
+        )}
+
+        <div style={{ display:"flex", gap:10, justifyContent:"flex-end", marginTop:24 }}>
+          <button onClick={onClose} style={{ fontSize:13, padding:"9px 16px", borderRadius:9, background:"transparent", border:`1px solid ${C.border}`, color:C.text2, cursor:"pointer" }}>Skip</button>
+          <button onClick={()=>onApply({ measure, agg, breakdown, preset })} disabled={!measure} style={{ fontSize:13, fontWeight:600, padding:"9px 22px", borderRadius:9, background:C.blue, border:"none", color:"#fff", cursor:"pointer", opacity:measure?1:.6 }}>
+            Build dashboard →
+          </button>
+        </div>
+      </div>
     </div>
   );
 }

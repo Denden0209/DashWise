@@ -252,6 +252,27 @@ export async function getFileSchema<T = unknown>(uid: string, folderId: string, 
     .map(p => p.data);
   try { return JSON.parse(parts.join("")) as T; } catch { return null; }
 }
+// ── Dashboard customizations (Explore tab) ─────────────────
+// User edits — title, label overrides, the saved starter view — stored as a
+// small JSON blob on the file doc so the dashboard reopens exactly as left.
+export async function saveDashboardConfig(
+  uid: string, folderId: string, fileId: string, config: unknown,
+): Promise<void> {
+  await updateDoc(doc(db, "users", uid, "folders", folderId, "files", fileId), {
+    dashboardConfig: JSON.stringify(config),
+  });
+}
+
+export async function getDashboardConfig<T = unknown>(
+  uid: string, folderId: string, fileId: string,
+): Promise<T | null> {
+  const snap = await getDoc(doc(db, "users", uid, "folders", folderId, "files", fileId));
+  if (!snap.exists()) return null;
+  const raw = snap.data().dashboardConfig;
+  if (!raw) return null;
+  try { return JSON.parse(raw) as T; } catch { return null; }
+}
+
 export async function saveUpload(uid: string, data: Omit<UploadRecord, "id">): Promise<string> {
   const ref = await addDoc(collection(db, "users", uid, "uploads"), { ...data, date: serverTimestamp() });
   await updateDoc(doc(db, "users", uid), { uploadsCount: increment(1) }).catch(() => {});

@@ -333,15 +333,41 @@ export function filterRows(cube: DataCube, filters: Filters, win?: DateWindow): 
   });
 }
 
+export type Agg = "sum" | "avg";
+
 export type MeasureSpec =
-  | { kind: "field"; field: string }
+  | { kind: "field"; field: string }                                 // sum of that field
+  | { kind: "avg"; field: string }                                   // sum(field) / sum(rows) — per-row average
   | { kind: "ratio"; num: string; den: string; pct?: boolean }       // sum(num)/sum(den)
   | { kind: "marginPct"; revenue: string; cost: string }             // (rev-cost)/rev
   | { kind: "count" };
 
+// Heuristic: should a numeric field be summed or averaged by default?
+// Rates, prices, percentages, scores and ages read wrong when summed —
+// "average unit price" is meaningful, "total unit price" is not.
+const AVG_HINT = /\b(avg|average|mean|median)\b|rate|ratio|pct|percent|%|margin|score|rating|index|age|unit\s*price|per\s|each|temperature|balance|level|utiliz|occupanc|conversion|aov/i;
+const SUM_HINT = /amount|revenue|sales|total|qty|quantity|count|units?|volume|profit|spend|income|expense|cost|fee|tax|gross|net|sum|orders?|transactions?/i;
+export function inferAgg(measure: string): Agg {
+  const n = measure.trim();
+  // A SUM-leaning name wins unless it also explicitly reads as an average/rate.
+  if (SUM_HINT.test(n) && !/\b(avg|average|mean)\b|rate|ratio|per\s|pct|percent|%/i.test(n)) return "sum";
+  if (AVG_HINT.test(n)) return "avg";
+  return "sum";
+}
+
+// Build the right MeasureSpec for a plain field given a chosen aggregation.
+export function specForMeasure(field: string, agg: Agg): MeasureSpec {
+  return agg === "avg" ? { kind: "avg", field } : { kind: "field", field };
+}
+
 export function computeMeasure(rows: CubeRow[], spec: MeasureSpec): number {
   if (spec.kind === "count") return rows.reduce((s, r) => s + r.n, 0);
   if (spec.kind === "field") return rows.reduce((s, r) => s + (r.m[spec.field] || 0), 0);
+  if (spec.kind === "avg") {
+    const sum = rows.reduce((s, r) => s + (r.m[spec.field] || 0), 0);
+    const n   = rows.reduce((s, r) => s + r.n, 0);
+    return n === 0 ? 0 : sum / n;
+  }
   if (spec.kind === "ratio") {
     const num = rows.reduce((s, r) => s + (r.m[spec.num] || 0), 0);
     const den = rows.reduce((s, r) => s + (r.m[spec.den] || 0), 0);

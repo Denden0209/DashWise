@@ -29,6 +29,7 @@ function sanitizeMeasure(m: any, measures: string[]): any | null {
   if (!m || typeof m !== "object") return null;
   if (m.kind === "count") return { kind: "count" };
   if (m.kind === "field" && measures.includes(m.field)) return { kind: "field", field: m.field };
+  if (m.kind === "avg" && measures.includes(m.field)) return { kind: "avg", field: m.field };
   if (m.kind === "ratio" && measures.includes(m.num) && measures.includes(m.den))
     return { kind: "ratio", num: m.num, den: m.den, pct: !!m.pct };
   if (m.kind === "marginPct" && measures.includes(m.revenue) && measures.includes(m.cost))
@@ -73,12 +74,14 @@ Respond with ONLY a valid JSON object — no markdown, no backticks, no commenta
 }
 
 Measure spec kinds:
-- {"kind":"field","field":"<measure name>"} — sum of that field
+- {"kind":"field","field":"<measure name>"} — SUM of that field (use for revenue, quantity, totals, counts of things)
+- {"kind":"avg","field":"<measure name>"} — AVERAGE per row (use for prices, rates, percentages, scores, ages — anything where a total would be meaningless)
 - {"kind":"count"} — row count
 - {"kind":"ratio","num":"<measure>","den":"<measure>","pct":true} — sum(num)/sum(den)
 - {"kind":"marginPct","revenue":"<measure>","cost":"<measure>"} — (rev-cost)/rev as %
 
 Rules:
+- Choose sum vs avg intelligently: a "unit price" or "rate" should be avg, "revenue" or "units sold" should be sum.
 - "dimension":"_date" means a time series at the chosen grain (use type "line")
 - Use ONLY field names exactly as listed in the schema
 - If the question can't be answered from this schema (e.g. needs a specific customer ID or fields not listed), return {"unsupported": true, "note": "explain briefly and suggest asking the Advisor chat instead"}`;
@@ -155,7 +158,8 @@ Rules:
 
     return NextResponse.json({
       success: true,
-      viewSpec: {
+      // NOTE: the client reads `spec` — keep this key in sync with dashboard-view/page.tsx
+      spec: {
         filters, grain,
         yoy: !!spec.yoy && schema.multiYear,
         dateWindow,
