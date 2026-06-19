@@ -2,7 +2,11 @@
 // Client-side parser + smart summarizer + data cube builder.
 // Runs entirely in the browser — zero API cost, no server request.
 // Outputs: (1) compact summary text for Claude, (2) DataCube for the
-// interactive dashboard (tabular files with a date column only).
+// interactive dashboard, (3) SchemaModel for the Developer tab.
+//
+// All tabular formats (CSV, Excel, delimited TXT, tabular JSON, PDF tables)
+// flow through ONE pipeline — materializeSheet → buildTabularResult — so the
+// schema model, smart summary and interactive cube are produced consistently.
 
 import { buildDataCube, DataCube, buildJoinLookups, enrichFactRows, SheetData } from "@/lib/dataCube";
 import { buildSchemaModel, SchemaModel } from "@/lib/schemaProfiler";
@@ -56,17 +60,41 @@ function isSummaryRow(row: unknown[], headers: string[]): boolean {
   if (nonEmpty <= 1 && headers.length > 3) return true;
   return false;
 }
+
+// Header detection: scans the first ~15 rows (real spreadsheets often have a
+// title/notes block before the header) and scores each candidate on how
+// "header-like" it is — mostly text, distinct values, densely filled, and not
+// numeric. The highest-scoring row wins. Used by every tabular format.
 function detectHeaderRow(aoa: unknown[][]): number {
-  for (let i = 0; i < Math.min(5, aoa.length); i++) {
-    const row      = aoa[i];
-    const strCount = row.filter(c => typeof c === "string" && (c as string).trim()).length;
-    const numCount = row.filter(c => isNumeric(c)).length;
-    if (strCount > numCount && strCount >= row.length * 0.5) return i;
+  const scan = Math.min(15, aoa.length);
+  let best = 0, bestScore = -Infinity;
+  for (let i = 0; i < scan; i++) {
+    const rawRow  = (aoa[i] as unknown[]) || [];
+    const cells   = rawRow.map(c => String(c ?? "").trim());
+    const nonEmpty = cells.filter(Boolean).length;
+    if (nonEmpty < 2) continue;                                   // title/blank rows
+    const strCount = cells.filter(c => c && isNaN(Number(c))).length;
+    const numCount = rawRow.filter(c => isNumeric(c)).length;
+    const uniqPct  = new Set(cells.filter(Boolean)).size / Math.max(nonEmpty, 1);
+    const density  = nonEmpty / Math.max(rawRow.length, 1);
+    const score    = strCount - numCount + uniqPct * 3 + density * 2;
+    if (score > bestScore) { bestScore = score; best = i; }
   }
-  return 0;
+  return best;
 }
 
-// ── Summarize one sheet ────────────────────────────────────
+// Materialize an array-of-arrays into the universal { name, headers, rows }
+// interface consumed by buildSchemaModel + buildDataCube.
+function materializeSheet(name: string, aoa: unknown[][]): SheetData {
+  const headerIdx = detectHeaderRow(aoa);
+  const headers   = ((aoa[headerIdx] as unknown[]) || []).map(h => String(h ?? "").trim());
+  const rows      = aoa.slice(headerIdx + 1).filter(row =>
+    !row.every(c => c === null || c === undefined || c === "") && !isSummaryRow(row, headers)
+  );
+  return { name, headers, rows };
+}
+
+// ── Summarize one sheet (legacy fallback when schema build fails) ──────────
 function summarizeSheet(sheetName: string, aoa: unknown[][]): string {
   if (aoa.length === 0) return `=== SHEET: ${sheetName} ===\n(empty)\n`;
 
@@ -204,15 +232,7 @@ function buildBestCube(
   sheets: { name: string; aoa: unknown[][] }[],
   schema: SchemaModel | null,
 ): DataCube | null {
-  // Materialize headers + dataRows per sheet once
-  const parsed: SheetData[] = sheets.map(s => {
-    const headerIdx = detectHeaderRow(s.aoa);
-    const headers   = (s.aoa[headerIdx] as unknown[]).map(h => String(h || "").trim());
-    const rows      = s.aoa.slice(headerIdx + 1).filter(row =>
-      !row.every(c => c === null || c === undefined || c === "") && !isSummaryRow(row, headers)
-    );
-    return { name: s.name, headers, rows };
-  });
+  const parsed: SheetData[] = sheets.map(s => materializeSheet(s.name, s.aoa));
 
   // Candidate fact sheets: prefer schema-identified fact tables, then by row count
   const factNames = new Set(schema?.factTables || []);
@@ -250,144 +270,342 @@ function buildBestCube(
   return null;
 }
 
-// ── Excel ──────────────────────────────────────────────────
-async function parseExcel(file: File): Promise<ParseResult> {
-  const XLSX   = await import("xlsx");
-  const ab     = await file.arrayBuffer();
-  const wb     = XLSX.read(ab, { type:"array", cellDates:true });
-  const sheets = wb.SheetNames.slice(0, MAX_SHEETS);
+// ── The shared tabular pipeline ────────────────────────────
+// CSV, Excel, delimited TXT, tabular JSON and PDF tables all converge here.
+// Produces schema model + smart summary + interactive cube in one place.
+function buildTabularResult(
+  fileName: string,
+  fileType: string,
+  sheetAoAs: { name: string; aoa: unknown[][] }[],
+  opts: { rawText?: string; rawRowThreshold?: number; sheets?: string[] } = {},
+): ParseResult {
+  const materialized = sheetAoAs.map(s => materializeSheet(s.name, s.aoa));
+  const totalRows    = materialized.reduce((sum, m) => sum + m.rows.length, 0);
 
-  const parts: string[] = [];
-  const sheetAoAs: { name: string; aoa: unknown[][] }[] = [];
-  let totalRows = 0;
-
-  for (const sheetName of sheets) {
-    const ws  = wb.Sheets[sheetName];
-    const aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { header:1, defval:"", raw:true });
-    if (aoa.length === 0) continue;
-    sheetAoAs.push({ name: sheetName, aoa });
-
-    const headerIdx = detectHeaderRow(aoa);
-    const headers   = (aoa[headerIdx] as unknown[]).map(h => String(h || "").trim()).filter(Boolean);
-    const dataRows  = aoa.slice(headerIdx + 1).filter(row =>
-      !row.every(c => c === null || c === undefined || c === "") && !isSummaryRow(row, headers)
-    );
-    totalRows += dataRows.length;
-  }
-
-  // ── Build the schema model (powers joins, Developer tab, smart summary) ──
-  const schemaSheets = sheetAoAs.map(s => {
-    const headerIdx = detectHeaderRow(s.aoa);
-    const headers   = (s.aoa[headerIdx] as unknown[]).map(h => String(h || "").trim());
-    const rows      = s.aoa.slice(headerIdx + 1).filter(row =>
-      !row.every(c => c === null || c === undefined || c === "") && !isSummaryRow(row, headers)
-    );
-    return { name: s.name, headers, rows };
-  });
   let schema: SchemaModel | null = null;
-  try { schema = buildSchemaModel(file.name, schemaSheets); }
+  try { schema = buildSchemaModel(fileName, materialized); }
   catch (e) { console.warn("[schema] build failed", e); }
 
-  // ── Smart multi-tab summary: importance-ranked, budget-aware, EVERY sheet
-  //    represented with headline KPIs (Phase 1). Replaces the old per-sheet
-  //    dump that truncated later tabs. ──
-  if (schema) {
-    parts.push(buildSmartSummary(file.name, schema, schemaSheets, 60_000));
+  const cube = buildBestCube(fileName, sheetAoAs, schema);
+
+  // Small files: keep the original raw text verbatim (cheaper, lossless).
+  let content: string;
+  let summarized: boolean;
+  if (opts.rawText !== undefined && opts.rawRowThreshold !== undefined && totalRows <= opts.rawRowThreshold) {
+    content    = opts.rawText;
+    summarized = false;
+  } else if (schema) {
+    content    = buildSmartSummary(fileName, schema, materialized, 60_000);
+    summarized = true;
   } else {
-    // Fallback to the legacy per-sheet summarizer if schema build failed
-    parts.push(`FILE: ${file.name}`);
-    parts.push(`Sheets: ${sheets.join(", ")}\n`);
-    for (const s of sheetAoAs) parts.push(summarizeSheet(s.name, s.aoa));
+    content    = sheetAoAs.map(s => summarizeSheet(s.name, s.aoa)).join("\n");
+    summarized = true;
   }
 
-  const cube = buildBestCube(file.name, sheetAoAs, schema);
-  if (cube) parts.push(`\n[INTERACTIVE DASHBOARD: enabled from sheet "${cube.sheetName}" — ${cube.sourceRowCount.toLocaleString()} rows, ${cube.dateRange.min} to ${cube.dateRange.max}, dimensions: ${cube.dimensions.map(d=>d.name).join(", ")}]`);
+  if (cube && summarized) {
+    content += `\n[INTERACTIVE DASHBOARD: enabled from sheet "${cube.sheetName}" — ` +
+      `${cube.sourceRowCount.toLocaleString()} rows, ${cube.dateRange.min} to ${cube.dateRange.max}, ` +
+      `dimensions: ${cube.dimensions.map(d => d.name).join(", ")}]`;
+  }
 
-  const content = parts.join("\n").trim();
+  const sheets = opts.sheets ?? (sheetAoAs.length > 1 ? sheetAoAs.map(s => s.name) : []);
   return {
     content, sheets, rowCount: totalRows,
-    fileType: file.name.split(".").pop()?.toLowerCase() || "xlsx",
-    fileName: file.name, chars: content.length,
-    truncated: content.length > MAX_CONTENT_CHARS, summarized: true, cube, schema,
+    fileType, fileName, chars: content.length,
+    truncated: content.length > MAX_CONTENT_CHARS, summarized, cube, schema,
   };
 }
 
-// ── CSV ────────────────────────────────────────────────────
-function parseCSVText(text: string): unknown[][] {
-  return text.split("\n").filter(l => l.trim()).map(line => {
-    const result: string[] = [];
-    let current = "", inQuotes = false;
-    for (const ch of line) {
-      if (ch === '"') { inQuotes = !inQuotes; continue; }
-      if (ch === "," && !inQuotes) { result.push(current.trim()); current = ""; continue; }
-      current += ch;
+// ── Excel ──────────────────────────────────────────────────
+async function parseExcel(file: File): Promise<ParseResult> {
+  const XLSX = await import("xlsx");
+  const ab   = await file.arrayBuffer();
+  const wb   = XLSX.read(ab, { type:"array", cellDates:true });
+
+  // Skip hidden / very-hidden sheets (Hidden: 0=visible, 1=hidden, 2=veryHidden)
+  const meta         = wb.Workbook?.Sheets;
+  const visibleNames = wb.SheetNames.filter((_, i) => ((meta?.[i]?.Hidden ?? 0) === 0));
+  const sheetNames   = (visibleNames.length ? visibleNames : wb.SheetNames).slice(0, MAX_SHEETS);
+
+  const sheetAoAs: { name: string; aoa: unknown[][] }[] = [];
+  for (const sheetName of sheetNames) {
+    const ws = wb.Sheets[sheetName];
+    if (!ws) continue;
+    const aoa = XLSX.utils.sheet_to_json<unknown[]>(ws, { header:1, defval:"", raw:true });
+    if (aoa.length === 0) continue;
+
+    // Fill merged cells: sheet_to_json only fills the merge's top-left anchor,
+    // leaving the rest blank — common in financial reports with merged headers.
+    const merges = ws["!merges"] as { s:{r:number;c:number}; e:{r:number;c:number} }[] | undefined;
+    if (merges) {
+      for (const m of merges) {
+        const anchor = (aoa[m.s.r] as unknown[] | undefined)?.[m.s.c];
+        if (anchor === undefined || anchor === "" || anchor === null) continue;
+        for (let r = m.s.r; r <= m.e.r; r++) {
+          const row = aoa[r] as unknown[] | undefined;
+          if (!row) continue;
+          for (let c = m.s.c; c <= m.e.c; c++) if (row[c] === "" || row[c] == null) row[c] = anchor;
+        }
+      }
     }
-    result.push(current.trim());
-    return result;
-  });
+    sheetAoAs.push({ name: sheetName, aoa });
+  }
+
+  if (sheetAoAs.length === 0) throw new Error("This Excel file has no readable sheets.");
+
+  const fileType = file.name.split(".").pop()?.toLowerCase() || "xlsx";
+  return buildTabularResult(file.name, fileType, sheetAoAs, { sheets: sheetNames });
 }
 
+// ── CSV (papaparse: robust quotes/newlines + auto delimiter) ───────────────
 async function parseCSV(file: File): Promise<ParseResult> {
   const text = await file.text();
-  const aoa  = parseCSVText(text);
-
-  const headers  = (aoa[0] as unknown[] || []).map(h => String(h || "").trim());
-  const dataRows = aoa.slice(1);
-  let schema: SchemaModel | null = null;
-  try { schema = buildSchemaModel(file.name, [{ name: file.name, headers, rows: dataRows }]); }
-  catch (e) { console.warn("[schema] csv build failed", e); }
-
-  const cube = buildBestCube(file.name, [{ name: file.name, aoa }], schema);
-
-  if (aoa.length <= RAW_ROW_LIMIT + 1) {
-    return { content:text, sheets:[], rowCount:aoa.length-1, fileType:"csv", fileName:file.name,
-             chars:text.length, truncated:false, summarized:false, cube, schema };
-  }
-  let summary: string;
-  if (schema) {
-    summary = buildSmartSummary(file.name, schema, [{ name: file.name, headers, rows: dataRows }], 60_000);
-  } else {
-    summary = summarizeSheet(file.name, aoa);
-  }
-  if (cube) summary += `\n[INTERACTIVE DASHBOARD: enabled — ${cube.sourceRowCount.toLocaleString()} rows, ${cube.dateRange.min} to ${cube.dateRange.max}]`;
-  return { content:summary, sheets:[], rowCount:aoa.length-1, fileType:"csv", fileName:file.name,
-           chars:summary.length, truncated:false, summarized:true, cube, schema };
+  const Papa = (await import("papaparse")).default;
+  const res  = Papa.parse<unknown[]>(text, {
+    header: false,
+    skipEmptyLines: "greedy",
+    dynamicTyping: true,
+    delimiter: "",            // "" = auto-detect ',' ';' '\t' '|'
+  });
+  const aoa = (res.data as unknown[][]) || [];
+  return buildTabularResult(file.name, "csv", [{ name: file.name, aoa }],
+    { rawText: text, rawRowThreshold: RAW_ROW_LIMIT });
 }
 
-// ── PDF / TXT / JSON (no cube — not tabular) ───────────────
+// ── Delimiter sniffing for TXT ─────────────────────────────
+function modeOf(arr: number[]): number {
+  const f = new Map<number, number>(); let best = -1, bestN = -1;
+  for (const x of arr) { const c = (f.get(x) || 0) + 1; f.set(x, c); if (c > best) { best = c; bestN = x; } }
+  return bestN;
+}
+function sniffDelimiter(text: string): string | null {
+  const lines = text.split(/\r?\n/).filter(l => l.trim()).slice(0, 20);
+  if (lines.length < 3) return null;
+  let bestDelim: string | null = null, bestCols = 1;
+  for (const d of ["\t", ",", "|", ";"]) {
+    const counts = lines.map(l => l.split(d).length - 1);
+    const m      = modeOf(counts);
+    if (m < 1) continue;
+    const consistent = counts.filter(c => c === m).length;
+    if (consistent >= lines.length * 0.8 && m + 1 > bestCols) { bestCols = m + 1; bestDelim = d; }
+  }
+  return bestDelim;
+}
+
+// ── TXT (table if clearly delimited, else plain text) ──────
+async function parseTXT(file: File): Promise<ParseResult> {
+  const text  = await file.text();
+  const delim = sniffDelimiter(text);
+  if (delim) {
+    const Papa = (await import("papaparse")).default;
+    const res  = Papa.parse<unknown[]>(text, {
+      header: false, skipEmptyLines: "greedy", dynamicTyping: true, delimiter: delim,
+    });
+    const aoa  = (res.data as unknown[][]) || [];
+    const cols = (aoa[0]?.length) || 0;
+    if (cols >= 2 && aoa.length >= 4) {
+      return buildTabularResult(file.name, "txt", [{ name: file.name, aoa }]);
+    }
+  }
+  return { content:text, sheets:[], rowCount:text.split("\n").filter(l=>l.trim()).length,
+           fileType:"txt", fileName:file.name, chars:text.length,
+           truncated:text.length>MAX_CONTENT_CHARS, summarized:false, cube:null, schema:null };
+}
+
+// ── JSON (tabular detection: array / wrapped / NDJSON → cube) ───────────────
+function extractRecords(parsed: unknown): Record<string, unknown>[] | null {
+  const isRecord = (x: unknown): x is Record<string, unknown> =>
+    !!x && typeof x === "object" && !Array.isArray(x) && !(x instanceof Date);
+  if (Array.isArray(parsed)) return parsed.filter(isRecord);
+  if (isRecord(parsed)) {
+    for (const k of ["data", "results", "records", "rows", "items"]) {
+      const v = parsed[k];
+      if (Array.isArray(v)) return v.filter(isRecord);
+    }
+  }
+  return null;
+}
+function recordsToTable(records: Record<string, unknown>[], cap = 5000): { headers: string[]; rows: unknown[][] } {
+  const sample  = records.slice(0, cap);
+  const headers: string[] = []; const seen = new Set<string>();
+  // Flatten one level deep with dotted keys; stringify anything deeper / arrays.
+  const flat = (obj: Record<string, unknown>): Record<string, unknown> => {
+    const out: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(obj)) {
+      if (v && typeof v === "object" && !Array.isArray(v) && !(v instanceof Date)) {
+        for (const [k2, v2] of Object.entries(v as Record<string, unknown>)) {
+          out[`${k}.${k2}`] = (v2 && typeof v2 === "object") ? JSON.stringify(v2) : v2;
+        }
+      } else {
+        out[k] = Array.isArray(v) ? JSON.stringify(v) : v;
+      }
+    }
+    return out;
+  };
+  const flatRecords = sample.map(flat);
+  flatRecords.forEach(fr => Object.keys(fr).forEach(k => { if (!seen.has(k)) { seen.add(k); headers.push(k); } }));
+  const rows = flatRecords.map(fr => headers.map(h => fr[h] ?? ""));
+  return { headers, rows };
+}
+
+async function parseJSON(file: File): Promise<ParseResult> {
+  const text = await file.text();
+  let parsed: unknown;
+  let records: Record<string, unknown>[] | null = null;
+
+  try {
+    parsed  = JSON.parse(text);
+    records = extractRecords(parsed);
+  } catch {
+    // NDJSON — one JSON object per line
+    const lines = text.split(/\r?\n/).map(l => l.trim()).filter(Boolean);
+    const objs: Record<string, unknown>[] = [];
+    let ok = lines.length > 0;
+    for (const l of lines) {
+      try {
+        const o = JSON.parse(l);
+        if (o && typeof o === "object" && !Array.isArray(o)) objs.push(o as Record<string, unknown>);
+      } catch { ok = false; break; }
+    }
+    if (ok && objs.length) { parsed = objs; records = objs; }
+    else throw new Error("This file is not valid JSON.");
+  }
+
+  if (records && records.length >= 3) {
+    const { headers, rows } = recordsToTable(records);
+    if (headers.length >= 2) {
+      const aoa: unknown[][] = [headers, ...rows];
+      return buildTabularResult(file.name, "json", [{ name: file.name, aoa }]);
+    }
+  }
+
+  // Non-tabular JSON (config, single object, deeply nested) → pretty-printed text
+  const content = JSON.stringify(parsed, null, 2);
+  return { content, sheets:[],
+           rowCount: Array.isArray(parsed) ? parsed.length : Object.keys((parsed as object) || {}).length,
+           fileType:"json", fileName:file.name, chars:content.length,
+           truncated:content.length>MAX_CONTENT_CHARS, summarized:false, cube:null, schema:null };
+}
+
+// ── PDF (layout-aware text + best-effort table extraction) ─────────────────
+type PdfCell = { str: string; x: number; w: number };
+type PdfLine = { y: number; cells: PdfCell[] };
+
+// Split a visual line into columns wherever the horizontal gap between adjacent
+// text fragments is much larger than the line's typical gap → table cells.
+function lineToCells(cells: PdfCell[]): string[] {
+  if (cells.length === 0) return [];
+  const gaps: number[] = [];
+  for (let i = 1; i < cells.length; i++) gaps.push(cells[i].x - (cells[i-1].x + cells[i-1].w));
+  const positive = gaps.filter(g => g > 0).sort((a, b) => a - b);
+  const median   = positive.length ? positive[Math.floor(positive.length / 2)] : 0;
+  const thresh   = Math.max(8, median * 1.8);
+  const out: string[] = []; let cur = cells[0].str;
+  for (let i = 1; i < cells.length; i++) {
+    const gap = cells[i].x - (cells[i-1].x + cells[i-1].w);
+    if (gap > thresh) { out.push(cur.trim()); cur = cells[i].str; }
+    else cur += " " + cells[i].str;
+  }
+  out.push(cur.trim());
+  return out;
+}
+
+// Find the dominant column count across all lines; if a consistent N≥2-column
+// table emerges, return it as { headers, rows }. Conservative — only fires when
+// the table is the clear majority of multi-column lines.
+function detectPdfTable(lines: PdfLine[]): { headers: string[]; rows: unknown[][] } | null {
+  const multi = lines.map(l => lineToCells(l.cells)).filter(c => c.length >= 2);
+  if (multi.length < 4) return null;
+  const freq = new Map<number, number>();
+  multi.forEach(r => freq.set(r.length, (freq.get(r.length) || 0) + 1));
+  let N = 0, best = 0;
+  for (const [n, c] of freq) if (n >= 2 && c > best) { best = c; N = n; }
+  const tableRows = multi.filter(r => r.length === N);
+  if (N < 2 || tableRows.length < 4 || tableRows.length < multi.length * 0.5) return null;
+  const headers = tableRows[0].map((h, i) => h || `Column_${i + 1}`);
+  const rows    = tableRows.slice(1) as unknown[][];
+  return { headers, rows };
+}
+
 async function parsePDF(file: File): Promise<ParseResult> {
   const pdfjsLib = await import("pdfjs-dist");
   pdfjsLib.GlobalWorkerOptions.workerSrc =
     `https://cdnjs.cloudflare.com/ajax/libs/pdf.js/${pdfjsLib.version}/pdf.worker.min.mjs`;
   const ab  = await file.arrayBuffer();
   const pdf = await pdfjsLib.getDocument({ data: ab }).promise;
-  const pages: string[] = [];
+
+  let docTitle = "";
+  try {
+    const md = await pdf.getMetadata();
+    docTitle = String((md?.info as { Title?: string } | undefined)?.Title || "").trim();
+  } catch { /* metadata optional */ }
+
+  const pageTexts: string[] = [];
+  const allLines:  PdfLine[] = [];
+  const Y_TOL = 3;
+
   for (let i = 1; i <= pdf.numPages; i++) {
-    const page    = await pdf.getPage(i);
-    const content = await page.getTextContent();
-    const text    = content.items.map((item: unknown) => (item as { str:string }).str).join(" ");
-    if (text.trim()) pages.push(`--- Page ${i} ---\n${text}`);
+    const page = await pdf.getPage(i);
+    const tc   = await page.getTextContent();
+    // pdfjs items are TextItem | TextMarkedContent; only TextItem has str/transform.
+    type RawItem = { str?: string; transform?: number[]; width?: number };
+    const items = (tc.items as RawItem[])
+      .filter((it): it is { str: string; transform: number[]; width?: number } =>
+        typeof it.str === "string" && it.str.length > 0 && Array.isArray(it.transform))
+      .map(it => ({ str: it.str, x: it.transform[4], y: it.transform[5], w: it.width || 0 }));
+    if (items.length === 0) continue;
+
+    // Sort top→bottom (PDF y grows upward), then left→right, group into lines.
+    items.sort((a, b) => b.y - a.y || a.x - b.x);
+    const lines: PdfLine[] = [];
+    for (const it of items) {
+      const last = lines[lines.length - 1];
+      if (last && Math.abs(last.y - it.y) <= Y_TOL) last.cells.push({ str: it.str, x: it.x, w: it.w });
+      else lines.push({ y: it.y, cells: [{ str: it.str, x: it.x, w: it.w }] });
+    }
+    lines.forEach(ln => ln.cells.sort((a, b) => a.x - b.x));
+    allLines.push(...lines);
+
+    const text = lines
+      .map(ln => ln.cells.map(c => c.str).join(" ").replace(/\s+/g, " ").trim())
+      .filter(Boolean).join("\n");
+    if (text) pageTexts.push(`--- Page ${i} ---\n${text}`);
   }
-  const content  = pages.join("\n\n").trim();
-  return { content, sheets:[], rowCount:content.split("\n").filter(l=>l.trim()).length,
+
+  const body       = pageTexts.join("\n\n").trim();
+  const meaningful = body.replace(/[^\w]/g, "").length;
+
+  // Scanned / image-only PDF: no extractable text layer.
+  if (meaningful < 20) {
+    const msg = `This PDF appears to be scanned or image-only — no extractable text was found. ` +
+      `Try uploading a text-based PDF, or an OCR'd version of this document.`;
+    return { content: msg, sheets:[], rowCount:0, fileType:"pdf", fileName:file.name,
+             chars: msg.length, truncated:false, summarized:false, cube:null, schema:null };
+  }
+
+  // Best-effort: if the PDF contains a clean table, unlock the interactive cube.
+  let cube: DataCube | null = null;
+  let schema: SchemaModel | null = null;
+  try {
+    const table = detectPdfTable(allLines);
+    if (table) {
+      const aoa: unknown[][] = [table.headers, ...table.rows];
+      try { schema = buildSchemaModel(file.name, [{ name: file.name, headers: table.headers, rows: table.rows }]); }
+      catch { schema = null; }
+      cube = buildBestCube(file.name, [{ name: file.name, aoa }], schema);
+    }
+  } catch (e) { console.warn("[pdf] table detection failed", e); }
+
+  const header = `--- Document: ${docTitle || file.name} (${pdf.numPages} page${pdf.numPages > 1 ? "s" : ""}) ---`;
+  let content  = `${header}\n\n${body}`;
+  if (cube) {
+    content += `\n\n[INTERACTIVE DASHBOARD: a table was detected in this PDF — ` +
+      `${cube.sourceRowCount.toLocaleString()} rows, dimensions: ${cube.dimensions.map(d => d.name).join(", ")}]`;
+  }
+
+  return { content, sheets:[], rowCount: body.split("\n").filter(l => l.trim()).length,
            fileType:"pdf", fileName:file.name, chars:content.length,
-           truncated:content.length > MAX_CONTENT_CHARS, summarized:false, cube:null, schema:null };
-}
-
-async function parseTXT(file: File): Promise<ParseResult> {
-  const text = await file.text();
-  return { content:text, sheets:[], rowCount:text.split("\n").filter(l=>l.trim()).length,
-           fileType:"txt", fileName:file.name, chars:text.length,
-           truncated:text.length>MAX_CONTENT_CHARS, summarized:false, cube:null, schema:null };
-}
-
-async function parseJSON(file: File): Promise<ParseResult> {
-  const text   = await file.text();
-  const parsed = JSON.parse(text);
-  const content = JSON.stringify(parsed, null, 2);
-  return { content, sheets:[], rowCount:Array.isArray(parsed)?parsed.length:Object.keys(parsed).length,
-           fileType:"json", fileName:file.name, chars:content.length,
-           truncated:false, summarized:false, cube:null, schema:null };
+           truncated:content.length > MAX_CONTENT_CHARS, summarized:false, cube, schema };
 }
 
 // ── Main export ────────────────────────────────────────────

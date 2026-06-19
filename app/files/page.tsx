@@ -41,6 +41,29 @@ function triggerEmbedding(uid: string, fileId: string, folderId: string, fileNam
   }).catch(err => console.warn("[embed] Non-critical:", err));
 }
 
+// Files above this size are routed to the Python data-processing service (Phase
+// 2) which handles 500k+ rows. Smaller files parse instantly in the browser.
+const LARGE_FILE_BYTES = 8 * 1024 * 1024;
+
+type ParsedFileData = {
+  content: string; sheets?: string[]; rowCount?: number;
+  cube?: unknown; schema?: unknown;
+};
+
+// Route a large/complex file through the server data service. Throws on any
+// failure so the caller can fall back to in-browser parsing.
+async function parseViaService(file: File, token: string): Promise<ParsedFileData> {
+  const fd = new FormData();
+  fd.set("file", file, file.name);
+  fd.set("fileName", file.name);
+  const res  = await fetch("/api/parse-proxy", {
+    method: "POST", headers: { Authorization: `Bearer ${token}` }, body: fd,
+  });
+  const data = await res.json().catch(() => null);
+  if (!res.ok || !data) throw new Error(data?.error || `Data service error (${res.status})`);
+  return data as ParsedFileData;
+}
+
 type FolderWithFiles = BusinessFolder & { files?: FolderFile[]; filesLoaded?: boolean };
 
 export default function FilesPage() {
@@ -229,8 +252,22 @@ export default function FilesPage() {
           type: file.name.split(".").pop()?.toLowerCase() || "unknown",
           status: "uploading",
         });
-        const { parseFileInBrowser } = await import("@/lib/parseFileClient");
-        const data = await parseFileInBrowser(file);
+        // Hybrid parsing: large/complex files go to the Python service (which
+        // handles 500k+ rows); everything else parses instantly in the browser.
+        // If the service is unconfigured or fails, fall back to browser parsing.
+        let data: ParsedFileData | null = null;
+        if (file.size > LARGE_FILE_BYTES) {
+          try {
+            const token = await user.getIdToken();
+            data = await parseViaService(file, token);
+          } catch (e) {
+            console.warn("[dataproc] falling back to browser parse:", e);
+          }
+        }
+        if (!data) {
+          const { parseFileInBrowser } = await import("@/lib/parseFileClient");
+          data = await parseFileInBrowser(file);
+        }
 
         await updateFileRecord(user.uid, activeFolderId, fileId, {
           parsedContent: data.content, sheets: data.sheets || [],
