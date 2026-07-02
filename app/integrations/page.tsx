@@ -3,6 +3,7 @@ import { useState, useEffect, Suspense } from "react";
 import { useSearchParams } from "next/navigation";
 import Link from "next/link";
 import { useAuth } from "@/lib/AuthContext";
+import { auth } from "@/lib/firebase";
 import { getUserFolders, BusinessFolder } from "@/lib/db";
 import Nav from "@/components/Nav";
 import { C, radius, shadow, btnPrimary } from "@/lib/styles";
@@ -70,7 +71,8 @@ function ShopifyConnected({ userId, shopInfo, folders }: { userId:string; shopIn
   async function handleSync() {
     if(!folder)return; setSyncing(true); setResult(null); setError("");
     try {
-      const res=await fetch("/api/shopify/sync",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({userId,folderId:folder,daysBack:90})});
+      const idToken=await auth.currentUser?.getIdToken();
+      const res=await fetch("/api/shopify/sync",{method:"POST",headers:{"Content-Type":"application/json",Authorization:`Bearer ${idToken||""}`},body:JSON.stringify({userId,folderId:folder,daysBack:90})});
       const data=await res.json();
       if(!data.success)throw new Error(data.error);
       setResult({orders:data.ordersCount,revenue:data.revenue});

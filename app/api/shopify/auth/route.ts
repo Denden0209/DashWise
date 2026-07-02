@@ -12,7 +12,10 @@ export async function POST(req: NextRequest) {
     const shop       = shopDomain.replace(/https?:\/\//,"").replace(/\//,"").trim();
     const fullDomain = shop.includes(".myshopify.com") ? shop : `${shop}.myshopify.com`;
     const state      = `${userId}_${randomBytes(16).toString("hex")}`;
-    const scopes     = "read_orders,read_products,read_customers,read_inventory,read_analytics";
+    // NOTE: read_analytics is not a grantable OAuth scope and causes an
+    // invalid_scope error on the authorize page. The sync only calls
+    // orders.json + products.json, so these four are all we need.
+    const scopes     = "read_orders,read_products,read_customers,read_inventory";
     const params     = new URLSearchParams({
       client_id:    process.env.SHOPIFY_CLIENT_ID!,
       scope:        scopes,

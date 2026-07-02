@@ -68,6 +68,13 @@ service cloud.firestore {
       match /uploads/{uploadId} {
         allow read, write: if isOwner(uid);
       }
+
+      // Connected integrations (Shopify, Clover…) — only the owner.
+      // Server routes write these with the Admin SDK (bypasses rules);
+      // this rule is what lets the client READ the connection status.
+      match /integrations/{integrationId} {
+        allow read, write: if isOwner(uid);
+      }
     }
 
     // ── Teams (Team tier) ──────────────────────────────────

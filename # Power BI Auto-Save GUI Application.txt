@@ -1,0 +1,449 @@
+# Power BI Auto-Save GUI Application
+Add-Type -AssemblyName System.Windows.Forms
+Add-Type -AssemblyName System.Drawing
+Add-Type -AssemblyName System.Runtime.InteropServices
+
+# Global variables
+$script:isRunning = $false
+$script:saveTimer = $null
+$script:saveCount = 0
+$script:statusTimer = $null
+
+# Function to find all Power BI Desktop windows
+function Find-AllPowerBIWindows {
+    $powerBIProcesses = Get-Process | Where-Object { 
+        $_.ProcessName -eq "PBIDesktop" -and
+        $_.MainWindowTitle -ne "" -and
+        $_.MainWindowHandle -ne 0
+    }
+    
+    if ($powerBIProcesses) {
+        $windows = @()
+        foreach ($process in $powerBIProcesses) {
+            $windows += [PSCustomObject]@{
+                Handle = $process.MainWindowHandle
+                Title = $process.MainWindowTitle
+                ProcessId = $process.Id
+            }
+        }
+        return $windows
+    }
+    return @()
+}
+
+# Function to check if Power BI file has been saved before
+function Test-PowerBIFileSaved {
+    param([String]$WindowTitle)
+    
+    if ($WindowTitle -match "Untitled|^Power BI Desktop$" -or $WindowTitle -eq "Power BI Desktop") {
+        return $false
+    }
+    return $true
+}
+
+# Function to handle Power Query popup dialogs
+function Handle-PowerQueryPopups {
+    param([IntPtr]$WindowHandle)
+    
+    try {
+        $signature = @'
+        [DllImport("user32.dll", CharSet = CharSet.Auto)]
+        public static extern IntPtr FindWindow(string lpClassName, string lpWindowName);
+        
+        [DllImport("user32.dll")]
+        public static extern bool SetForegroundWindow(IntPtr hWnd);
+'@
+        
+        $typeName = "Win32DialogFunctions_" + [System.Guid]::NewGuid().ToString("N").Substring(0,8)
+        
+        if (-not ([System.Management.Automation.PSTypeName]"Win32Dialog.$typeName").Type) {
+            $Win32Dialog = Add-Type -MemberDefinition $signature -Name $typeName -Namespace Win32Dialog -PassThru
+        } else {
+            $Win32Dialog = [System.Type]::GetType("Win32Dialog.$typeName")
+        }
+        
+        $dialogTitles = @(
+            "Apply query changes",
+            "Power Query Editor", 
+            "Refresh",
+            "Data source settings"
+        )
+        
+        foreach ($title in $dialogTitles) {
+            try {
+                $dialogHandle = $Win32Dialog::FindWindow($null, $title)
+                if ($dialogHandle -ne [IntPtr]::Zero -and $dialogHandle -ne $WindowHandle) {
+                    $Win32Dialog::SetForegroundWindow($dialogHandle)
+                    Start-Sleep -Milliseconds 300
+                    [System.Windows.Forms.SendKeys]::SendWait("{ESC}")
+                    Start-Sleep -Milliseconds 300
+                    [System.Windows.Forms.SendKeys]::SendWait("{TAB}{ENTER}")
+                    Start-Sleep -Milliseconds 300
+                    return $true
+                }
+            }
+            catch {
+                continue
+            }
+        }
+        return $false
+    }
+    catch {
+        return $false
+    }
+}
+
+# Function to save Power BI file
+function Save-PowerBIFile {
+    param([PSCustomObject]$PowerBIWindow)
+    
+    $typeName = "Win32Functions_" + [System.Guid]::NewGuid().ToString("N").Substring(0,8)
+    $signature = @'
+    [DllImport("user32.dll")]
+    public static extern bool SetForegroundWindow(IntPtr hWnd);
+    
+    [DllImport("user32.dll")]
+    public static extern bool ShowWindow(IntPtr hWnd, int nCmdShow);
+    
+    [DllImport("user32.dll")]
+    public static extern bool IsWindow(IntPtr hWnd);
+'@
+    
+    try {
+        if (-not ([System.Management.Automation.PSTypeName]"Win32.$typeName").Type) {
+            $Win32 = Add-Type -MemberDefinition $signature -Name $typeName -Namespace Win32 -PassThru
+        } else {
+            $Win32 = [System.Type]::GetType("Win32.$typeName")
+        }
+    }
+    catch {
+        return @{ Success = $false; Message = "Could not load Windows API functions" }
+    }
+    
+    if (-not $Win32::IsWindow($PowerBIWindow.Handle)) {
+        return @{ Success = $false; Message = "Window no longer valid" }
+    }
+    
+    if (-not (Test-PowerBIFileSaved -WindowTitle $PowerBIWindow.Title)) {
+        return @{ Success = $false; Message = "File not saved (appears to be new/untitled)" }
+    }
+    
+    $Win32::ShowWindow($PowerBIWindow.Handle, 9)
+    $Win32::SetForegroundWindow($PowerBIWindow.Handle)
+    Start-Sleep -Milliseconds 750
+    
+    Handle-PowerQueryPopups -WindowHandle $PowerBIWindow.Handle
+    
+    [System.Windows.Forms.SendKeys]::SendWait("^s")
+    Start-Sleep -Milliseconds 500
+    
+    Handle-PowerQueryPopups -WindowHandle $PowerBIWindow.Handle
+    
+    $fileName = if ($PowerBIWindow.Title -match '(.+\.pbix)') { 
+        $matches[1] 
+    } else { 
+        ($PowerBIWindow.Title -split ' - ')[0] 
+    }
+    
+    return @{ Success = $true; Message = "Saved: '$fileName'" }
+}
+
+# Function to perform auto-save on all files
+function Perform-AutoSave {
+    $script:saveCount++
+    
+    # Header for this save cycle
+    $headerText = "`n" + "="*60 + "`n"
+    $headerText += "AUTO-SAVE CYCLE #$($script:saveCount) - $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n"
+    $headerText += "="*60 + "`n"
+    Update-LogDisplay $headerText
+    
+    $powerBIWindows = Find-AllPowerBIWindows
+    
+    if ($powerBIWindows.Count -eq 0) {
+        Update-LogDisplay "❌ NO POWER BI FILES DETECTED`n"
+        Update-LogDisplay "   Please open Power BI Desktop with saved files.`n"
+        Update-LogDisplay ("-"*60 + "`n")
+        return
+    }
+    
+    Update-LogDisplay "📂 DETECTED $($powerBIWindows.Count) POWER BI FILE(S):`n"
+    
+    $savedCount = 0
+    $skippedCount = 0
+    
+    # Process each file individually with detailed reporting
+    for ($i = 0; $i -lt $powerBIWindows.Count; $i++) {
+        $window = $powerBIWindows[$i]
+        $fileNumber = $i + 1
+        
+        # Extract clean filename for display
+        $fileName = if ($window.Title -match '(.+\.pbix)') { 
+            $matches[1] 
+        } else { 
+            ($window.Title -split ' - ')[0] 
+        }
+        
+        Update-LogDisplay "`n[$fileNumber/$($powerBIWindows.Count)] PROCESSING: '$fileName'`n"
+        Update-LogDisplay "    ⏳ Attempting to save...`n"
+        
+        # Attempt to save the file
+        $result = Save-PowerBIFile -PowerBIWindow $window
+        
+        if ($result.Success) {
+            $savedCount++
+            Update-LogDisplay "    ✅ SUCCESS: File saved successfully`n"
+            Update-LogDisplay "    📁 Location: Current file location preserved`n"
+            Update-LogDisplay "    ⏰ Time: $(Get-Date -Format 'HH:mm:ss')`n"
+        } else {
+            $skippedCount++
+            Update-LogDisplay "    ❌ FAILED: $($result.Message)`n"
+            Update-LogDisplay "    ⚠️  Action: Please check file status manually`n"
+            Update-LogDisplay "    ⏰ Time: $(Get-Date -Format 'HH:mm:ss')`n"
+        }
+        
+        # Add separator between files (except for last file)
+        if ($i -lt $powerBIWindows.Count - 1) {
+            Update-LogDisplay ("    " + "-"*50 + "`n")
+        }
+        
+        Start-Sleep -Milliseconds 500
+    }
+    
+    # Summary footer
+    $footerText = "`n" + "="*60 + "`n"
+    $footerText += "CYCLE #$($script:saveCount) SUMMARY:`n"
+    $footerText += "✅ Successfully Saved: $savedCount file(s)`n"
+    $footerText += "❌ Failed/Skipped: $skippedCount file(s)`n"
+    $footerText += "📊 Total Files Processed: $($powerBIWindows.Count)`n"
+    $footerText += "⏰ Completed at: $(Get-Date -Format 'HH:mm:ss')`n"
+    $footerText += "⏳ Next save in: $([int]$intervalNumeric.Value) minute(s)`n"
+    $footerText += "="*60 + "`n"
+    Update-LogDisplay $footerText
+    
+    # Update status bar with detailed info
+    $successRate = if ($powerBIWindows.Count -gt 0) { [math]::Round(($savedCount / $powerBIWindows.Count) * 100, 1) } else { 0 }
+    $statusLabel.Text = "Status: Running - Last save: $(Get-Date -Format 'HH:mm:ss') ✅ $savedCount/$($powerBIWindows.Count) files ($successRate% success)"
+}
+
+# Function to update log display
+function Update-LogDisplay {
+    param([string]$newText)
+    
+    if ($logTextBox.InvokeRequired) {
+        $logTextBox.Invoke([Action[string]]${function:Update-LogDisplay}, $newText)
+        return
+    }
+    
+    $logTextBox.AppendText($newText)
+    $logTextBox.ScrollToCaret()
+    
+    # Keep log size manageable (last 10000 characters)
+    if ($logTextBox.Text.Length -gt 10000) {
+        $logTextBox.Text = $logTextBox.Text.Substring($logTextBox.Text.Length - 8000)
+    }
+}
+
+# Function to start auto-save
+function Start-AutoSave {
+    if ($script:isRunning) { return }
+    
+    $script:isRunning = $true
+    $script:saveCount = 0
+    
+    $startButton.Enabled = $false
+    $stopButton.Enabled = $true
+    $intervalNumeric.Enabled = $false
+    
+    $statusLabel.Text = "Status: Starting auto-save..."
+    Update-LogDisplay ("`n" + "="*60 + "`n")
+    Update-LogDisplay "🚀 AUTO-SAVE STARTED`n"
+    Update-LogDisplay "⏰ Save Interval: $([int]$intervalNumeric.Value) minute(s)`n"
+    Update-LogDisplay "📊 Initial file scan commencing...`n"
+    Update-LogDisplay ("="*60 + "`n")
+    
+    # Perform initial save
+    Perform-AutoSave
+    
+    # Set up timer for recurring saves
+    $intervalMs = [int]$intervalNumeric.Value * 60 * 1000  # Convert minutes to milliseconds
+    $script:saveTimer = New-Object System.Windows.Forms.Timer
+    $script:saveTimer.Interval = $intervalMs
+    $script:saveTimer.Add_Tick({ Perform-AutoSave })
+    $script:saveTimer.Start()
+    
+    # Set up status update timer (every 5 seconds)
+    $script:statusTimer = New-Object System.Windows.Forms.Timer
+    $script:statusTimer.Interval = 5000
+    $script:statusTimer.Add_Tick({
+        if ($script:isRunning) {
+            $nextSave = [math]::Ceiling(($script:saveTimer.Interval - ($script:saveTimer.Interval % 1000)) / 1000 / 60)
+            $fileCount = (Find-AllPowerBIWindows).Count
+            $statusLabel.Text = "Status: Running - Next save in ~$nextSave min ($fileCount Power BI files detected)"
+        }
+    })
+    $script:statusTimer.Start()
+}
+
+# Function to stop auto-save
+function Stop-AutoSave {
+    if (-not $script:isRunning) { return }
+    
+    $script:isRunning = $false
+    
+    if ($script:saveTimer) {
+        $script:saveTimer.Stop()
+        $script:saveTimer.Dispose()
+        $script:saveTimer = $null
+    }
+    
+    if ($script:statusTimer) {
+        $script:statusTimer.Stop()
+        $script:statusTimer.Dispose()
+        $script:statusTimer = $null
+    }
+    
+    $startButton.Enabled = $true
+    $stopButton.Enabled = $false
+    $intervalNumeric.Enabled = $true
+    
+    $statusLabel.Text = "Status: Stopped"
+    Update-LogDisplay ("`n" + "="*60 + "`n")
+    Update-LogDisplay "🛑 AUTO-SAVE STOPPED`n"
+    Update-LogDisplay "📊 Final Status: $($script:saveCount) save cycle(s) completed`n"
+    Update-LogDisplay "⏰ Stopped at: $(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')`n"
+    Update-LogDisplay ("="*60 + "`n")
+}
+
+# Create main form
+$form = New-Object System.Windows.Forms.Form
+$form.Text = "Power BI Auto-Save Manager"
+$form.Size = New-Object System.Drawing.Size(700, 550)
+$form.StartPosition = "CenterScreen"
+$form.FormBorderStyle = "FixedSingle"
+$form.MaximizeBox = $false
+
+# Title label
+$titleLabel = New-Object System.Windows.Forms.Label
+$titleLabel.Text = "Power BI Auto-Save Manager"
+$titleLabel.Font = New-Object System.Drawing.Font("Segoe UI", 16, [System.Drawing.FontStyle]::Bold)
+$titleLabel.ForeColor = [System.Drawing.Color]::DarkBlue
+$titleLabel.Location = New-Object System.Drawing.Point(20, 20)
+$titleLabel.Size = New-Object System.Drawing.Size(400, 35)
+$form.Controls.Add($titleLabel)
+
+# Settings panel
+$settingsPanel = New-Object System.Windows.Forms.Panel
+$settingsPanel.Location = New-Object System.Drawing.Point(20, 70)
+$settingsPanel.Size = New-Object System.Drawing.Size(640, 80)
+$settingsPanel.BorderStyle = "FixedSingle"
+$form.Controls.Add($settingsPanel)
+
+# Interval label and numeric
+$intervalLabel = New-Object System.Windows.Forms.Label
+$intervalLabel.Text = "Save Interval (minutes):"
+$intervalLabel.Location = New-Object System.Drawing.Point(10, 20)
+$intervalLabel.Size = New-Object System.Drawing.Size(150, 20)
+$settingsPanel.Controls.Add($intervalLabel)
+
+$intervalNumeric = New-Object System.Windows.Forms.NumericUpDown
+$intervalNumeric.Location = New-Object System.Drawing.Point(170, 18)
+$intervalNumeric.Size = New-Object System.Drawing.Size(80, 23)
+$intervalNumeric.Minimum = 1
+$intervalNumeric.Maximum = 60
+$intervalNumeric.Value = 2
+$settingsPanel.Controls.Add($intervalNumeric)
+
+# Control buttons
+$startButton = New-Object System.Windows.Forms.Button
+$startButton.Text = "▶ Start Auto-Save"
+$startButton.Location = New-Object System.Drawing.Point(280, 15)
+$startButton.Size = New-Object System.Drawing.Size(140, 35)
+$startButton.BackColor = [System.Drawing.Color]::LightGreen
+$startButton.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$startButton.Add_Click({ Start-AutoSave })
+$settingsPanel.Controls.Add($startButton)
+
+$stopButton = New-Object System.Windows.Forms.Button
+$stopButton.Text = "⏹ Stop Auto-Save"
+$stopButton.Location = New-Object System.Drawing.Point(440, 15)
+$stopButton.Size = New-Object System.Drawing.Size(140, 35)
+$stopButton.BackColor = [System.Drawing.Color]::LightCoral
+$stopButton.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+$stopButton.Enabled = $false
+$stopButton.Add_Click({ Stop-AutoSave })
+$settingsPanel.Controls.Add($stopButton)
+
+# Log display
+$logLabel = New-Object System.Windows.Forms.Label
+$logLabel.Text = "Activity Log:"
+$logLabel.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+$logLabel.Location = New-Object System.Drawing.Point(20, 170)
+$logLabel.Size = New-Object System.Drawing.Size(200, 20)
+$form.Controls.Add($logLabel)
+
+$logTextBox = New-Object System.Windows.Forms.TextBox
+$logTextBox.Location = New-Object System.Drawing.Point(20, 195)
+$logTextBox.Size = New-Object System.Drawing.Size(640, 250)
+$logTextBox.Multiline = $true
+$logTextBox.ScrollBars = "Vertical"
+$logTextBox.ReadOnly = $true
+$logTextBox.Font = New-Object System.Drawing.Font("Consolas", 9)
+$logTextBox.BackColor = [System.Drawing.Color]::Black
+$logTextBox.ForeColor = [System.Drawing.Color]::LimeGreen
+$form.Controls.Add($logTextBox)
+
+# Status bar
+$statusLabel = New-Object System.Windows.Forms.Label
+$statusLabel.Text = "Status: Ready"
+$statusLabel.Location = New-Object System.Drawing.Point(20, 460)
+$statusLabel.Size = New-Object System.Drawing.Size(640, 20)
+$statusLabel.BackColor = [System.Drawing.Color]::LightGray
+$statusLabel.BorderStyle = "Fixed3D"
+$form.Controls.Add($statusLabel)
+
+# Initial log message with better formatting
+Update-LogDisplay ("="*60 + "`n")
+Update-LogDisplay "POWER BI AUTO-SAVE MANAGER v2.0`n"
+Update-LogDisplay ("="*60 + "`n")
+Update-LogDisplay "🚀 Application started successfully`n"
+Update-LogDisplay "📋 Instructions:`n"
+Update-LogDisplay "   1. Set your desired save interval (minutes)`n"
+Update-LogDisplay "   2. Click 'Start Auto-Save' to begin monitoring`n"
+Update-LogDisplay "   3. Monitor this log for detailed save reports`n"
+Update-LogDisplay ("="*60 + "`n")
+
+# Form closing event
+$form.Add_FormClosing({
+    Stop-AutoSave
+})
+
+# Check for Power BI files on startup with better formatting
+$initialWindows = Find-AllPowerBIWindows
+if ($initialWindows.Count -gt 0) {
+    Update-LogDisplay "`n📂 STARTUP SCAN RESULTS:`n"
+    Update-LogDisplay "✅ Found $($initialWindows.Count) Power BI file(s) currently open:`n`n"
+    for ($i = 0; $i -lt $initialWindows.Count; $i++) {
+        $window = $initialWindows[$i]
+        $fileName = if ($window.Title -match '(.+\.pbix)') { $matches[1] } else { ($window.Title -split ' - ')[0] }
+        Update-LogDisplay "   [$($i + 1)] 📄 '$fileName'`n"
+        Update-LogDisplay "       🆔 Process ID: $($window.ProcessId)`n"
+        Update-LogDisplay "       📊 Status: Ready for auto-save`n"
+        if ($i -lt $initialWindows.Count - 1) {
+            Update-LogDisplay "`n"
+        }
+    }
+    Update-LogDisplay ("`n" + "="*60 + "`n")
+    Update-LogDisplay "🎯 All files detected successfully!`n"
+    Update-LogDisplay "⭐ Ready to start auto-save when you click the button.`n"
+    Update-LogDisplay ("="*60 + "`n")
+} else {
+    Update-LogDisplay "`n❌ STARTUP SCAN RESULTS:`n"
+    Update-LogDisplay "   No Power BI files currently detected.`n"
+    Update-LogDisplay "   Please open Power BI Desktop with saved files first.`n"
+    Update-LogDisplay ("`n" + "="*60 + "`n")
+}
+
+# Show the form
+[System.Windows.Forms.Application]::EnableVisualStyles()
+$form.ShowDialog()
